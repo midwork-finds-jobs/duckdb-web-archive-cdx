@@ -31,8 +31,27 @@
 #include <zlib.h>
 #include <vector>
 #include <sstream>
+#include <chrono>
 
 namespace duckdb {
+
+// Cache for collinfo.json (1 day TTL)
+struct CollInfoCache {
+	string latest_crawl_id;
+	std::chrono::system_clock::time_point cached_at;
+	bool is_valid;
+
+	CollInfoCache() : is_valid(false) {}
+
+	bool IsExpired() const {
+		if (!is_valid) return true;
+		auto now = std::chrono::system_clock::now();
+		auto age = std::chrono::duration_cast<std::chrono::hours>(now - cached_at).count();
+		return age >= 24; // 1 day = 24 hours
+	}
+};
+
+static CollInfoCache g_collinfo_cache;
 
 // Structure to hold CDX record data
 struct CDXRecord {
@@ -44,6 +63,7 @@ struct CDXRecord {
 	string mime_type;
 	string digest;
 	int32_t status_code;
+	string crawl_id;
 };
 
 // Structure to hold bind data for the table function
@@ -257,6 +277,7 @@ static vector<CDXRecord> QueryCDXAPI(ClientContext &context, const string &index
 			record.timestamp = ExtractJSONValue(line, "timestamp");
 			record.mime_type = ExtractJSONValue(line, "mime");
 			record.digest = ExtractJSONValue(line, "digest");
+			record.crawl_id = index_name;
 
 			string status_str = ExtractJSONValue(line, "status");
 			record.status_code = status_str.empty() ? 0 : std::stoi(status_str);
@@ -413,33 +434,31 @@ static string FetchWARCResponse(ClientContext &context, const CDXRecord &record)
 	}
 }
 
+// Forward declarations
+static string GetLatestCrawlId(ClientContext &context);
+
 // Bind function for the table function
 static unique_ptr<FunctionData> CommonCrawlBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	fprintf(stderr, "[DEBUG] CommonCrawlBind called\n");
 	fflush(stderr);
-	// Expect 1-2 parameters: index name, optional limit
-	// URL filtering is now done via WHERE clause (predicate pushdown)
-	if (input.inputs.size() < 1 || input.inputs.size() > 2) {
-		throw BinderException("common_crawl_index requires 1-2 parameters: index_name, optional cdx_limit");
+
+	// No parameters required - crawl_id will be set from WHERE clause or default to latest
+	// Optional: single parameter for cdx_limit
+	if (input.inputs.size() > 1) {
+		throw BinderException("common_crawl_index requires 0-1 parameters: optional cdx_limit");
 	}
 
-	if (input.inputs[0].type().id() != LogicalTypeId::VARCHAR) {
-		throw BinderException("common_crawl_index index name must be a string");
-	}
+	// Start with empty index_name - will be set from filter or default to latest
+	auto bind_data = make_uniq<CommonCrawlBindData>("");
 
-	fprintf(stderr, "[DEBUG] Getting index name\n");
-	string index_name = input.inputs[0].ToString();
-	fprintf(stderr, "[DEBUG] Index name: %s\n", index_name.c_str());
-	auto bind_data = make_uniq<CommonCrawlBindData>(index_name);
-
-	// Check for optional limit parameter (now 2nd param instead of 3rd)
-	if (input.inputs.size() == 2) {
-		if (input.inputs[1].type().id() != LogicalTypeId::BIGINT &&
-		    input.inputs[1].type().id() != LogicalTypeId::INTEGER) {
+	// Check for optional limit parameter
+	if (input.inputs.size() == 1) {
+		if (input.inputs[0].type().id() != LogicalTypeId::BIGINT &&
+		    input.inputs[0].type().id() != LogicalTypeId::INTEGER) {
 			throw BinderException("common_crawl_index cdx_limit must be an integer");
 		}
-		bind_data->max_results = input.inputs[1].GetValue<int64_t>();
+		bind_data->max_results = input.inputs[0].GetValue<int64_t>();
 	}
 
 	// Define output columns
@@ -475,6 +494,10 @@ static unique_ptr<FunctionData> CommonCrawlBind(ClientContext &context, TableFun
 	return_types.push_back(LogicalType::BIGINT);
 	bind_data->fields_needed.push_back("length");
 
+	// Add crawl_id column (populated from index_name)
+	names.push_back("crawl_id");
+	return_types.push_back(LogicalType::VARCHAR);
+
 	// Add response column (optional - will be NULL if not fetched)
 	// Using BLOB type to handle binary content (PDFs, images, etc.)
 	names.push_back("response");
@@ -497,6 +520,12 @@ static unique_ptr<GlobalTableFunctionState> CommonCrawlInitGlobal(ClientContext 
 	fprintf(stderr, "[DEBUG] CommonCrawlInitGlobal called\n");
 	auto &bind_data = const_cast<CommonCrawlBindData&>(input.bind_data->Cast<CommonCrawlBindData>());
 	auto state = make_uniq<CommonCrawlGlobalState>();
+
+	// If no crawl_id was specified in WHERE clause, fetch the latest one
+	if (bind_data.index_name.empty()) {
+		bind_data.index_name = GetLatestCrawlId(context);
+		fprintf(stderr, "[DEBUG] Using latest crawl_id: %s\n", bind_data.index_name.c_str());
+	}
 
 	// Store which columns are selected for projection pushdown
 	state->column_ids = input.column_ids;
@@ -581,6 +610,45 @@ static timestamp_t ParseCDXTimestamp(const string &cdx_timestamp) {
 	}
 }
 
+// Helper function to fetch the latest crawl_id from collinfo.json (with 1-day caching)
+static string GetLatestCrawlId(ClientContext &context) {
+	// Check if cache is valid and not expired
+	if (!g_collinfo_cache.IsExpired()) {
+		return g_collinfo_cache.latest_crawl_id;
+	}
+
+	// Fetch collinfo.json using httpfs and json extension
+	fprintf(stderr, "[DEBUG] Fetching latest crawl_id from collinfo.json\n");
+
+	string collinfo_url = "https://index.commoncrawl.org/collinfo.json";
+	Connection con(context.db->GetDatabase(context));
+
+	// Ensure json extension is loaded
+	con.Query("INSTALL json");
+	con.Query("LOAD json");
+
+	// Read the first entry from collinfo.json (newest crawl)
+	auto result = con.Query("SELECT id FROM read_json('" + collinfo_url + "') LIMIT 1");
+
+	if (result->HasError()) {
+		throw IOException("Failed to fetch collinfo.json: " + result->GetError());
+	}
+
+	if (result->RowCount() == 0) {
+		throw IOException("collinfo.json returned no results");
+	}
+
+	auto latest_id = result->GetValue(0, 0).ToString();
+
+	// Update cache
+	g_collinfo_cache.latest_crawl_id = latest_id;
+	g_collinfo_cache.cached_at = std::chrono::system_clock::now();
+	g_collinfo_cache.is_valid = true;
+
+	fprintf(stderr, "[DEBUG] Latest crawl_id: %s\n", latest_id.c_str());
+	return latest_id;
+}
+
 // Scan function for the table function
 static void CommonCrawlScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	fprintf(stderr, "[DEBUG] CommonCrawlScan called\n");
@@ -624,6 +692,9 @@ static void CommonCrawlScan(ClientContext &context, TableFunctionInput &data, Da
 				} else if (col_name == "length") {
 					auto data_ptr = FlatVector::GetData<int64_t>(output.data[proj_idx]);
 					data_ptr[output_offset] = record.length;
+				} else if (col_name == "crawl_id") {
+					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], record.crawl_id);
 				} else if (col_name == "response") {
 					if (bind_data.fetch_response) {
 						string response = FetchWARCResponse(context, record);
@@ -786,6 +857,14 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 			fprintf(stderr, "[DEBUG] URL filter converted pattern: '%s'\n", bind_data.url_filter.c_str());
 			filters_to_remove.push_back(i);
 		}
+		// Handle crawl_id filtering (sets the index_name to use)
+		else if (column_name == "crawl_id" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+			if (filter->type == ExpressionType::COMPARE_EQUAL) {
+				bind_data.index_name = constant.value.ToString();
+				fprintf(stderr, "[DEBUG] crawl_id filter set index_name to: %s\n", bind_data.index_name.c_str());
+				filters_to_remove.push_back(i);
+			}
+		}
 		// Handle status_code filtering (uses CDX filter parameter)
 		// CDX API syntax: filter==statuscode:200 means &filter==statuscode:200
 		// (one = for parameter, one = for exact match operator)
@@ -828,26 +907,28 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Or set autoload_known_extensions=1 and autoinstall_known_extensions=1
 
 	// Register the common_crawl_index table function with variable arguments
-	// URL filtering is done via WHERE clause, not function parameter
+	// crawl_id filtering is done via WHERE clause
+	// Defaults to latest crawl_id from collinfo.json if not specified
 	TableFunctionSet common_crawl_set("common_crawl_index");
 
-	// Single parameter version: common_crawl_index('CC-MAIN-2025-43')
+	// No parameter version: common_crawl_index()
+	// Use: WHERE crawl_id = 'CC-MAIN-2025-43' to specify crawl
 	// Use: WHERE url LIKE '*.example.com/*' for URL filtering
-	auto func1 = TableFunction({LogicalType::VARCHAR},
+	auto func0 = TableFunction({},
+	                           CommonCrawlScan, CommonCrawlBind, CommonCrawlInitGlobal);
+	func0.cardinality = CommonCrawlCardinality;
+	func0.pushdown_complex_filter = CommonCrawlPushdownComplexFilter;
+	func0.projection_pushdown = true; // Enable projection pushdown
+	common_crawl_set.AddFunction(func0);
+
+	// Single parameter version: common_crawl_index(100)
+	// Parameter is CDX API result limit
+	auto func1 = TableFunction({LogicalType::BIGINT},
 	                           CommonCrawlScan, CommonCrawlBind, CommonCrawlInitGlobal);
 	func1.cardinality = CommonCrawlCardinality;
 	func1.pushdown_complex_filter = CommonCrawlPushdownComplexFilter;
 	func1.projection_pushdown = true; // Enable projection pushdown
 	common_crawl_set.AddFunction(func1);
-
-	// Two parameter version: common_crawl_index('CC-MAIN-2025-43', 100)
-	// Second param is CDX API result limit
-	auto func2 = TableFunction({LogicalType::VARCHAR, LogicalType::BIGINT},
-	                           CommonCrawlScan, CommonCrawlBind, CommonCrawlInitGlobal);
-	func2.cardinality = CommonCrawlCardinality;
-	func2.pushdown_complex_filter = CommonCrawlPushdownComplexFilter;
-	func2.projection_pushdown = true; // Enable projection pushdown
-	common_crawl_set.AddFunction(func2);
 
 	loader.RegisterFunction(common_crawl_set);
 }
