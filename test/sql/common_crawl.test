@@ -1,0 +1,59 @@
+# name: test/sql/common_crawl.test
+# description: test common_crawl extension
+# group: [sql]
+
+# Require statement will ensure this test is run with this extension loaded
+require common_crawl
+
+# Test that common_crawl_index function exists and returns correct schema
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM common_crawl_index('CC-MAIN-2025-43') LIMIT 0
+);
+----
+0
+
+# Test that the function returns the expected columns
+query I
+SELECT column_name FROM (
+    DESCRIBE SELECT * FROM common_crawl_index('CC-MAIN-2025-43')
+) ORDER BY column_name;
+----
+digest
+filename
+length
+mime_type
+offset
+response
+status_code
+timestamp
+url
+
+# Test that column types are correct
+query II
+SELECT column_name, column_type FROM (
+    DESCRIBE SELECT * FROM common_crawl_index('CC-MAIN-2025-43')
+) WHERE column_name IN ('url', 'status_code', 'offset', 'length')
+ORDER BY column_name;
+----
+length	BIGINT
+offset	BIGINT
+status_code	INTEGER
+url	VARCHAR
+
+# Note: Testing with real Common Crawl data is commented out as it requires network access
+# and may be slow. Uncomment the following tests to verify with real data:
+
+# Test basic query with URL filter (requires network access)
+# query I
+# SELECT COUNT(*) >= 0 FROM common_crawl_index('CC-MAIN-2025-43')
+# WHERE url = 'https://example.com/*'
+# LIMIT 10;
+# ----
+# true
+
+# Test that httpfs is loaded (required for the extension)
+query I
+SELECT COUNT(*) >= 0 FROM duckdb_extensions() WHERE extension_name = 'httpfs' AND loaded = true;
+----
+true

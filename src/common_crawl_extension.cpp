@@ -1,0 +1,786 @@
+#define DUCKDB_EXTENSION_MAIN
+
+#include "common_crawl_extension.hpp"
+#include "duckdb.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/gzip_file_system.hpp"
+
+// OpenSSL linked through vcpkg
+#include <openssl/opensslv.h>
+
+// zlib for gzip decompression
+#include <zlib.h>
+#include <vector>
+#include <sstream>
+
+namespace duckdb {
+
+// Structure to hold CDX record data
+struct CDXRecord {
+	string url;
+	string filename;
+	int64_t offset;
+	int64_t length;
+	string timestamp;
+	string mime_type;
+	string digest;
+	int32_t status_code;
+};
+
+// Structure to hold bind data for the table function
+struct CommonCrawlBindData : public TableFunctionData {
+	string index_name;
+	vector<string> column_names;
+	vector<LogicalType> column_types;
+	vector<string> fields_needed;
+	bool fetch_response;
+	string url_filter;
+	vector<string> cdx_filters; // CDX API filter parameters (e.g., "=status:200", "=mime:text/html")
+	idx_t max_results; // Maximum number of results to fetch from CDX API
+
+	CommonCrawlBindData(string index) : index_name(std::move(index)), fetch_response(false), url_filter("*"), max_results(10000) {}
+};
+
+// Structure to hold global state for the table function
+struct CommonCrawlGlobalState : public GlobalTableFunctionState {
+	vector<CDXRecord> records;
+	idx_t current_position;
+	vector<column_t> column_ids; // Which columns are actually selected
+
+	CommonCrawlGlobalState() : current_position(0) {}
+
+	idx_t MaxThreads() const override {
+		return 1; // Single-threaded for now
+	}
+};
+
+// Helper to sanitize strings for DuckDB (remove invalid UTF-8 sequences)
+static string SanitizeUTF8(const string &str) {
+	string result;
+	result.reserve(str.size());
+
+	for (size_t i = 0; i < str.size(); ) {
+		unsigned char c = static_cast<unsigned char>(str[i]);
+
+		// ASCII character (0-127)
+		if (c < 0x80) {
+			result += c;
+			i++;
+			continue;
+		}
+
+		// Multi-byte UTF-8 character
+		int len = 0;
+		if ((c & 0xE0) == 0xC0) len = 2;      // 2-byte
+		else if ((c & 0xF0) == 0xE0) len = 3; // 3-byte
+		else if ((c & 0xF8) == 0xF0) len = 4; // 4-byte
+		else {
+			// Invalid start byte, replace with ?
+			result += '?';
+			i++;
+			continue;
+		}
+
+		// Check if we have enough bytes
+		if (i + len > str.size()) {
+			// Truncated sequence, replace with ?
+			result += '?';
+			break;
+		}
+
+		// Validate continuation bytes
+		bool valid = true;
+		for (int j = 1; j < len; j++) {
+			if ((static_cast<unsigned char>(str[i + j]) & 0xC0) != 0x80) {
+				valid = false;
+				break;
+			}
+		}
+
+		if (valid) {
+			// Add the valid multi-byte sequence
+			result.append(str, i, len);
+			i += len;
+		} else {
+			// Invalid sequence, replace with ?
+			result += '?';
+			i++;
+		}
+	}
+
+	return result;
+}
+
+// Safe wrapper for creating DuckDB string Values
+static Value SafeStringValue(const string &str) {
+	try {
+		string sanitized = SanitizeUTF8(str);
+		return Value(sanitized);
+	} catch (const std::exception &ex) {
+		// If sanitization still fails, return empty string
+		fprintf(stderr, "[ERROR] Failed to create Value for string: %s (error: %s)\n",
+		        str.substr(0, 100).c_str(), ex.what());
+		return Value("");
+	} catch (...) {
+		fprintf(stderr, "[ERROR] Failed to create Value for string: %s (unknown error)\n",
+		        str.substr(0, 100).c_str());
+		return Value("");
+	}
+}
+
+// Simple JSON value extractor - extracts value for a given key from a JSON object line
+static string ExtractJSONValue(const string &json_line, const string &key) {
+	string search = "\"" + key + "\": \"";
+	size_t start = json_line.find(search);
+	if (start == string::npos) {
+		// Try without space after colon
+		search = "\"" + key + "\":\"";
+		start = json_line.find(search);
+		if (start == string::npos) {
+			return "";
+		}
+	}
+	start += search.length();
+	size_t end = json_line.find("\"", start);
+	if (end == string::npos) {
+		return "";
+	}
+	return SanitizeUTF8(json_line.substr(start, end - start));
+}
+
+// Helper function to query CDX API using FileSystem
+static vector<CDXRecord> QueryCDXAPI(ClientContext &context, const string &index_name, const string &url_pattern,
+                                      const vector<string> &fields_needed, const vector<string> &cdx_filters, idx_t max_results) {
+	fprintf(stderr, "[DEBUG] QueryCDXAPI started\n");
+	vector<CDXRecord> records;
+
+	// Helper lambda to map DuckDB column names to CDX API field names
+	auto map_column_to_field = [](const string &col_name) -> string {
+		if (col_name == "mime_type") return "mime";
+		if (col_name == "status_code") return "status";
+		return col_name; // url, digest, timestamp, filename, offset, length stay the same
+	};
+
+	// Construct field list for &fl= parameter to optimize the query
+	// Only request fields that are actually needed
+	string field_list = "";
+	bool need_warc_fields = false;
+	for (size_t i = 0; i < fields_needed.size(); i++) {
+		if (i > 0) {
+			field_list += ",";
+		}
+		field_list += map_column_to_field(fields_needed[i]);
+
+		// Check if we need WARC fields for parsing
+		if (fields_needed[i] == "filename" || fields_needed[i] == "offset" || fields_needed[i] == "length") {
+			need_warc_fields = true;
+		}
+	}
+
+	// Construct the CDX API URL
+	// Add limit parameter to control how many results we fetch
+	string cdx_url = "https://index.commoncrawl.org/" + index_name + "-index?url=" + url_pattern +
+	                 "&output=json&fl=" + field_list + "&limit=" + to_string(max_results);
+
+	// Add filter parameters (e.g., filter==statuscode:200)
+	for (const auto &filter : cdx_filters) {
+		cdx_url += "&filter=" + filter;
+	}
+
+	// Debug: print the final CDX URL
+	fprintf(stderr, "[CDX URL] %s\n", cdx_url.c_str());
+
+	try {
+		fprintf(stderr, "[DEBUG] Opening CDX URL\n");
+		// Use FileSystem to fetch the CDX data
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto file_handle = fs.OpenFile(cdx_url, FileFlags::FILE_FLAGS_READ);
+
+		fprintf(stderr, "[DEBUG] Reading CDX response\n");
+		// Read the entire response
+		string response_data;
+		const idx_t buffer_size = 8192;
+		auto buffer = unique_ptr<char[]>(new char[buffer_size]);
+
+		while (true) {
+			int64_t bytes_read = file_handle->Read(buffer.get(), buffer_size);
+			if (bytes_read <= 0) {
+				break;
+			}
+			response_data.append(buffer.get(), bytes_read);
+		}
+
+		fprintf(stderr, "[DEBUG] Got %lu bytes, sanitizing UTF-8\n", (unsigned long)response_data.size());
+		// Sanitize the entire response to ensure valid UTF-8
+		response_data = SanitizeUTF8(response_data);
+		fprintf(stderr, "[DEBUG] UTF-8 sanitization complete\n");
+
+		// Parse newline-delimited JSON
+		fprintf(stderr, "[DEBUG] Parsing JSON lines\n");
+		std::istringstream stream(response_data);
+		string line;
+		int line_count = 0;
+
+		while (std::getline(stream, line)) {
+			if (line.empty() || line[0] != '{') {
+				continue;
+			}
+			line_count++;
+
+			CDXRecord record;
+
+			// Extract fields from JSON line
+			record.url = ExtractJSONValue(line, "url");
+			if (record.url.empty()) {
+				continue; // Skip invalid records
+			}
+
+			record.timestamp = ExtractJSONValue(line, "timestamp");
+			record.mime_type = ExtractJSONValue(line, "mime");
+			record.digest = ExtractJSONValue(line, "digest");
+
+			string status_str = ExtractJSONValue(line, "status");
+			record.status_code = status_str.empty() ? 0 : std::stoi(status_str);
+
+			if (need_warc_fields) {
+				record.filename = ExtractJSONValue(line, "filename");
+				string offset_str = ExtractJSONValue(line, "offset");
+				string length_str = ExtractJSONValue(line, "length");
+
+				record.offset = offset_str.empty() ? 0 : std::stoll(offset_str);
+				record.length = length_str.empty() ? 0 : std::stoll(length_str);
+			}
+
+			records.push_back(record);
+		}
+		fprintf(stderr, "[DEBUG] Parsed %d JSON lines, got %lu records\n", line_count, (unsigned long)records.size());
+
+	} catch (std::exception &ex) {
+		throw IOException("Error querying CDX API: " + string(ex.what()));
+	} catch (...) {
+		throw IOException("Unknown error querying CDX API");
+	}
+
+	return records;
+}
+
+// Helper function to parse WARC format and extract HTTP response body
+static string ParseWARCResponse(const string &warc_data) {
+	// WARC format has headers followed by HTTP response
+	// We want to extract just the HTTP response body (skip both WARC and HTTP headers)
+
+	// Find the end of WARC headers (double newline)
+	size_t warc_headers_end = warc_data.find("\r\n\r\n");
+	if (warc_headers_end == string::npos) {
+		warc_headers_end = warc_data.find("\n\n");
+		if (warc_headers_end == string::npos) {
+			return ""; // Invalid WARC format
+		}
+		warc_headers_end += 2;
+	} else {
+		warc_headers_end += 4;
+	}
+
+	// After WARC headers comes the HTTP response
+	// Find the end of HTTP headers (double newline)
+	size_t http_headers_end = warc_data.find("\r\n\r\n", warc_headers_end);
+	if (http_headers_end == string::npos) {
+		http_headers_end = warc_data.find("\n\n", warc_headers_end);
+		if (http_headers_end == string::npos) {
+			return ""; // Invalid HTTP format
+		}
+		http_headers_end += 2;
+	} else {
+		http_headers_end += 4;
+	}
+
+	// Return the HTTP body
+	return warc_data.substr(http_headers_end);
+}
+
+// Helper function to decompress gzip data using zlib
+static string DecompressGzip(const char *compressed_data, size_t compressed_size) {
+	// Initialize zlib stream
+	z_stream stream;
+	memset(&stream, 0, sizeof(stream));
+
+	// Initialize for gzip decompression (windowBits = 15 + 16 for gzip format)
+	int ret = inflateInit2(&stream, 15 + 16);
+	if (ret != Z_OK) {
+		return "[Error: Failed to initialize gzip decompression]";
+	}
+
+	// Set input
+	stream.avail_in = compressed_size;
+	stream.next_in = (Bytef *)compressed_data;
+
+	// Prepare output buffer (estimate 10x compression ratio)
+	std::vector<char> decompressed_buffer;
+	decompressed_buffer.reserve(compressed_size * 10);
+
+	// Decompress in chunks
+	const size_t chunk_size = 32768; // 32 KB chunks
+	char out_buffer[chunk_size];
+
+	do {
+		stream.avail_out = chunk_size;
+		stream.next_out = (Bytef *)out_buffer;
+
+		ret = inflate(&stream, Z_NO_FLUSH);
+
+		if (ret != Z_OK && ret != Z_STREAM_END) {
+			inflateEnd(&stream);
+			return "[Error: Gzip decompression failed with code " + to_string(ret) + "]";
+		}
+
+		size_t produced = chunk_size - stream.avail_out;
+		decompressed_buffer.insert(decompressed_buffer.end(), out_buffer, out_buffer + produced);
+
+	} while (ret != Z_STREAM_END);
+
+	inflateEnd(&stream);
+
+	// Convert to string
+	return string(decompressed_buffer.begin(), decompressed_buffer.end());
+}
+
+// Helper function to fetch WARC response using FileSystem API
+static string FetchWARCResponse(ClientContext &context, const CDXRecord &record) {
+	if (record.filename.empty() || record.offset == 0 || record.length == 0) {
+		return ""; // Invalid record
+	}
+
+	try {
+		// Construct the WARC URL
+		string warc_url = "https://data.commoncrawl.org/" + record.filename;
+
+		// Get the file system from the database context
+		auto &fs = FileSystem::GetFileSystem(context);
+
+		// Open the file through httpfs (HTTP URLs are handled when httpfs is loaded)
+		auto file_handle = fs.OpenFile(warc_url, FileFlags::FILE_FLAGS_READ);
+
+		// Allocate buffer for the compressed data
+		auto buffer = unique_ptr<char[]>(new char[record.length]);
+
+		// Seek to the offset and read the specified length
+		// httpfs should translate this into HTTP Range request: bytes=offset-(offset+length-1)
+		file_handle->Seek(record.offset);
+		int64_t bytes_read = file_handle->Read(buffer.get(), record.length);
+
+		if (bytes_read <= 0) {
+			return "[Error: Failed to read data from WARC file]";
+		}
+
+		// The data we read is gzip compressed
+		// We need to decompress it to get the WARC content
+		string decompressed = DecompressGzip(buffer.get(), bytes_read);
+
+		// Parse the WARC format to extract just the HTTP response body
+		if (decompressed.find("[") == 0) {
+			// If decompression returned an error message, return it
+			return decompressed;
+		}
+
+		return ParseWARCResponse(decompressed);
+
+	} catch (Exception &ex) {
+		// Return error message for debugging
+		return "[Error fetching WARC: " + string(ex.what()) + "]";
+	} catch (std::exception &ex) {
+		return "[Error fetching WARC: " + string(ex.what()) + "]";
+	} catch (...) {
+		return "[Unknown error fetching WARC]";
+	}
+}
+
+// Bind function for the table function
+static unique_ptr<FunctionData> CommonCrawlBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	fprintf(stderr, "[DEBUG] CommonCrawlBind called\n");
+	fflush(stderr);
+	// Expect 1-3 parameters: index name, optional URL pattern, optional limit
+	if (input.inputs.size() < 1 || input.inputs.size() > 3) {
+		throw BinderException("common_crawl_index requires 1-3 parameters: index_name, optional url_pattern, optional limit");
+	}
+
+	if (input.inputs[0].type().id() != LogicalTypeId::VARCHAR) {
+		throw BinderException("common_crawl_index index name must be a string");
+	}
+
+	fprintf(stderr, "[DEBUG] Getting index name\n");
+	string index_name = input.inputs[0].ToString();
+	fprintf(stderr, "[DEBUG] Index name: %s\n", index_name.c_str());
+	auto bind_data = make_uniq<CommonCrawlBindData>(index_name);
+
+	// Check for optional URL pattern parameter
+	if (input.inputs.size() >= 2) {
+		if (input.inputs[1].type().id() != LogicalTypeId::VARCHAR) {
+			throw BinderException("common_crawl_index url_pattern must be a string");
+		}
+		bind_data->url_filter = input.inputs[1].ToString();
+	}
+
+	// Check for optional limit parameter
+	if (input.inputs.size() == 3) {
+		if (input.inputs[2].type().id() != LogicalTypeId::BIGINT &&
+		    input.inputs[2].type().id() != LogicalTypeId::INTEGER) {
+			throw BinderException("common_crawl_index limit must be an integer");
+		}
+		bind_data->max_results = input.inputs[2].GetValue<int64_t>();
+	}
+
+	// Define output columns
+	names.push_back("url");
+	return_types.push_back(LogicalType::VARCHAR);
+	bind_data->fields_needed.push_back("url");
+
+	names.push_back("timestamp");
+	return_types.push_back(LogicalType::VARCHAR);
+	bind_data->fields_needed.push_back("timestamp");
+
+	names.push_back("mime_type");
+	return_types.push_back(LogicalType::VARCHAR);
+	bind_data->fields_needed.push_back("mime_type");
+
+	names.push_back("status_code");
+	return_types.push_back(LogicalType::INTEGER);
+	bind_data->fields_needed.push_back("status_code");
+
+	names.push_back("digest");
+	return_types.push_back(LogicalType::VARCHAR);
+	bind_data->fields_needed.push_back("digest");
+
+	names.push_back("filename");
+	return_types.push_back(LogicalType::VARCHAR);
+	bind_data->fields_needed.push_back("filename");
+
+	names.push_back("offset");
+	return_types.push_back(LogicalType::BIGINT);
+	bind_data->fields_needed.push_back("offset");
+
+	names.push_back("length");
+	return_types.push_back(LogicalType::BIGINT);
+	bind_data->fields_needed.push_back("length");
+
+	// Add response column (optional - will be NULL if not fetched)
+	// Using BLOB type to handle binary content (PDFs, images, etc.)
+	names.push_back("response");
+	return_types.push_back(LogicalType::BLOB);
+
+	// Enable response fetching (implemented with HTTP range requests + gzip decompression)
+	// Note: This will fetch WARC files which can be slow for large result sets
+	// Projection pushdown will control whether this is actually fetched
+	bind_data->fetch_response = true;
+
+	bind_data->column_names = names;
+	bind_data->column_types = return_types;
+
+	return std::move(bind_data);
+}
+
+// Init global state function
+static unique_ptr<GlobalTableFunctionState> CommonCrawlInitGlobal(ClientContext &context,
+                                                                    TableFunctionInitInput &input) {
+	fprintf(stderr, "[DEBUG] CommonCrawlInitGlobal called\n");
+	auto &bind_data = const_cast<CommonCrawlBindData&>(input.bind_data->Cast<CommonCrawlBindData>());
+	auto state = make_uniq<CommonCrawlGlobalState>();
+
+	// Store which columns are selected for projection pushdown
+	state->column_ids = input.column_ids;
+	fprintf(stderr, "[DEBUG] Projected columns: ");
+	for (auto &col_id : input.column_ids) {
+		fprintf(stderr, "%lu ", (unsigned long)col_id);
+	}
+	fprintf(stderr, "\n");
+
+	// Determine which fields are actually needed based on projection
+	vector<string> needed_fields;
+	bool need_response = false;
+	bool need_warc = false;
+
+	for (auto &col_id : input.column_ids) {
+		if (col_id < bind_data.column_names.size()) {
+			string col_name = bind_data.column_names[col_id];
+			fprintf(stderr, "[DEBUG] Column %lu = %s\n", (unsigned long)col_id, col_name.c_str());
+
+			if (col_name == "response") {
+				need_response = true;
+				need_warc = true; // Response requires filename/offset/length
+			} else if (col_name == "filename" || col_name == "offset" || col_name == "length") {
+				need_warc = true;
+			}
+
+			// Add all selected columns to needed_fields (except response which is computed)
+			if (col_name != "response") {
+				needed_fields.push_back(col_name);
+			}
+		}
+	}
+
+	// If we need WARC data, ensure we have filename, offset, length
+	if (need_warc) {
+		if (std::find(needed_fields.begin(), needed_fields.end(), "filename") == needed_fields.end()) {
+			needed_fields.push_back("filename");
+		}
+		if (std::find(needed_fields.begin(), needed_fields.end(), "offset") == needed_fields.end()) {
+			needed_fields.push_back("offset");
+		}
+		if (std::find(needed_fields.begin(), needed_fields.end(), "length") == needed_fields.end()) {
+			needed_fields.push_back("length");
+		}
+	}
+
+	// Override fetch_response based on projection
+	bind_data.fetch_response = need_response;
+	fprintf(stderr, "[DEBUG] fetch_response = %d, need_warc = %d\n", bind_data.fetch_response, need_warc);
+
+	// Use the URL filter from bind data (could be set via filter pushdown)
+	string url_pattern = bind_data.url_filter;
+	fprintf(stderr, "[DEBUG] About to call QueryCDXAPI with %lu fields\n", (unsigned long)needed_fields.size());
+
+	// Query CDX API with optimized field list
+	state->records = QueryCDXAPI(context, bind_data.index_name, url_pattern, needed_fields, bind_data.cdx_filters, bind_data.max_results);
+
+	fprintf(stderr, "[DEBUG] QueryCDXAPI returned %lu records\n", (unsigned long)state->records.size());
+	return std::move(state);
+}
+
+// Scan function for the table function
+static void CommonCrawlScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	fprintf(stderr, "[DEBUG] CommonCrawlScan called\n");
+	auto &bind_data = data.bind_data->Cast<CommonCrawlBindData>();
+	auto &gstate = data.global_state->Cast<CommonCrawlGlobalState>();
+	fprintf(stderr, "[DEBUG] Have %lu records to process\n", (unsigned long)gstate.records.size());
+
+	idx_t output_offset = 0;
+	while (gstate.current_position < gstate.records.size() && output_offset < STANDARD_VECTOR_SIZE) {
+		auto &record = gstate.records[gstate.current_position];
+
+		bool row_success = true;
+
+		// Process each projected column
+		for (idx_t proj_idx = 0; proj_idx < gstate.column_ids.size(); proj_idx++) {
+			auto col_id = gstate.column_ids[proj_idx];
+			string col_name = bind_data.column_names[col_id];
+
+			try {
+				if (col_name == "url") {
+					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.url));
+				} else if (col_name == "timestamp") {
+					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.timestamp));
+				} else if (col_name == "mime_type") {
+					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.mime_type));
+				} else if (col_name == "status_code") {
+					auto data_ptr = FlatVector::GetData<int32_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = record.status_code;
+				} else if (col_name == "digest") {
+					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.digest));
+				} else if (col_name == "filename") {
+					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.filename));
+				} else if (col_name == "offset") {
+					auto data_ptr = FlatVector::GetData<int64_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = record.offset;
+				} else if (col_name == "length") {
+					auto data_ptr = FlatVector::GetData<int64_t>(output.data[proj_idx]);
+					data_ptr[output_offset] = record.length;
+				} else if (col_name == "response") {
+					if (bind_data.fetch_response) {
+						string response = FetchWARCResponse(context, record);
+						auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
+						// Use AddStringOrBlob for binary data (no UTF-8 validation)
+						data_ptr[output_offset] = StringVector::AddStringOrBlob(output.data[proj_idx], response);
+					} else {
+						FlatVector::SetNull(output.data[proj_idx], output_offset, true);
+					}
+				}
+			} catch (const std::exception &ex) {
+				fprintf(stderr, "[ERROR] Failed to process column %s for row %lu: %s\n",
+				        col_name.c_str(), (unsigned long)gstate.current_position, ex.what());
+				row_success = false;
+				break;
+			}
+		}
+
+		if (row_success) {
+			output_offset++;
+		}
+		gstate.current_position++;
+	}
+
+	output.SetCardinality(output_offset);
+}
+
+// Filter pushdown function to handle WHERE clauses
+static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+                                               vector<unique_ptr<Expression>> &filters) {
+	fprintf(stderr, "[DEBUG] CommonCrawlPushdownComplexFilter called with %lu filters\n", (unsigned long)filters.size());
+	auto &bind_data = bind_data_p->Cast<CommonCrawlBindData>();
+
+
+	// Build a map of column names to their indices
+	std::unordered_map<string, idx_t> column_map;
+	for (idx_t i = 0; i < bind_data.column_names.size(); i++) {
+		column_map[bind_data.column_names[i]] = i;
+	}
+
+	// Look for filters we can push down
+	vector<idx_t> filters_to_remove;
+
+	for (idx_t i = 0; i < filters.size(); i++) {
+		auto &filter = filters[i];
+
+		// Check if this is a comparison expression
+		if (filter->GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
+			continue;
+		}
+		if (filter->type != ExpressionType::COMPARE_EQUAL &&
+		    filter->type != ExpressionType::COMPARE_NOTEQUAL) {
+			continue;
+		}
+
+		auto &comparison = filter->Cast<BoundComparisonExpression>();
+
+		// Check if left side is a bound column reference
+		if (comparison.left->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto &col_ref = comparison.left->Cast<BoundColumnRefExpression>();
+
+		// Check if right side is a constant value
+		if (comparison.right->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			continue;
+		}
+		auto &constant = comparison.right->Cast<BoundConstantExpression>();
+
+		// Get the column binding
+		idx_t table_index = col_ref.binding.table_index;
+
+		// Get the column name from the expression itself (this is the most reliable way)
+		string column_name = col_ref.GetName();
+
+		// Validate table index matches our table
+		if (table_index != get.table_index) {
+			continue;
+		}
+
+		// Handle URL filtering (special case - uses url parameter)
+		if (column_name == "url" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+			bind_data.url_filter = constant.value.ToString();
+			filters_to_remove.push_back(i);
+		}
+		// Handle status_code filtering (uses CDX filter parameter)
+		// CDX API syntax: filter==statuscode:200 means &filter==statuscode:200
+		// (one = for parameter, one = for exact match operator)
+		else if (column_name == "status_code" &&
+		         (constant.value.type().id() == LogicalTypeId::INTEGER ||
+		          constant.value.type().id() == LogicalTypeId::BIGINT)) {
+			string op = (filter->type == ExpressionType::COMPARE_EQUAL) ? "=" : "!";
+			string filter_str = op + "statuscode:" + to_string(constant.value.GetValue<int32_t>());
+			bind_data.cdx_filters.push_back(filter_str);
+			filters_to_remove.push_back(i);
+		}
+		// Handle mime_type filtering (uses CDX filter parameter)
+		else if (column_name == "mime_type" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+			string op = (filter->type == ExpressionType::COMPARE_EQUAL) ? "=" : "!";
+			string filter_str = op + "mime:" + constant.value.ToString();
+			bind_data.cdx_filters.push_back(filter_str);
+			filters_to_remove.push_back(i);
+		}
+	}
+
+	// Remove filters that we've pushed down (in reverse order to maintain indices)
+	for (idx_t i = filters_to_remove.size(); i > 0; i--) {
+		filters.erase(filters.begin() + filters_to_remove[i - 1]);
+	}
+}
+
+// Cardinality function to handle LIMIT pushdown
+static unique_ptr<NodeStatistics> CommonCrawlCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<CommonCrawlBindData>();
+	// Return the max results as an estimate - this helps DuckDB optimize the query plan
+	return make_uniq<NodeStatistics>(bind_data.max_results);
+}
+
+static void LoadInternal(ExtensionLoader &loader) {
+	fprintf(stderr, "\n[DEBUG] *** COMMON_CRAWL EXTENSION LOADING ***\n");
+	fflush(stderr);
+
+	// Note: httpfs extension must be loaded before using this extension
+	// Users should run: INSTALL httpfs; LOAD httpfs; before loading this extension
+	// Or set autoload_known_extensions=1 and autoinstall_known_extensions=1
+
+	// Register the common_crawl_index table function with variable arguments
+	// Accepts: (index_name) or (index_name, url_pattern)
+	TableFunctionSet common_crawl_set("common_crawl_index");
+
+	// Single parameter version: common_crawl_index('CC-MAIN-2025-43')
+	auto func1 = TableFunction({LogicalType::VARCHAR},
+	                           CommonCrawlScan, CommonCrawlBind, CommonCrawlInitGlobal);
+	func1.cardinality = CommonCrawlCardinality;
+	func1.pushdown_complex_filter = CommonCrawlPushdownComplexFilter;
+	func1.projection_pushdown = true; // Enable projection pushdown
+	common_crawl_set.AddFunction(func1);
+
+	// Two parameter version: common_crawl_index('CC-MAIN-2025-43', '*.example.com/*')
+	auto func2 = TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                           CommonCrawlScan, CommonCrawlBind, CommonCrawlInitGlobal);
+	func2.cardinality = CommonCrawlCardinality;
+	func2.pushdown_complex_filter = CommonCrawlPushdownComplexFilter;
+	func2.projection_pushdown = true; // Enable projection pushdown
+	common_crawl_set.AddFunction(func2);
+
+	// Three parameter version: common_crawl_index('CC-MAIN-2025-43', '*.example.com/*', 100)
+	auto func3 = TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+	                           CommonCrawlScan, CommonCrawlBind, CommonCrawlInitGlobal);
+	func3.cardinality = CommonCrawlCardinality;
+	func3.pushdown_complex_filter = CommonCrawlPushdownComplexFilter;
+	func3.projection_pushdown = true; // Enable projection pushdown
+	common_crawl_set.AddFunction(func3);
+
+	loader.RegisterFunction(common_crawl_set);
+}
+
+void CommonCrawlExtension::Load(ExtensionLoader &loader) {
+	LoadInternal(loader);
+}
+std::string CommonCrawlExtension::Name() {
+	return "common_crawl";
+}
+
+std::string CommonCrawlExtension::Version() const {
+#ifdef EXT_VERSION_COMMON_CRAWL
+	return EXT_VERSION_COMMON_CRAWL;
+#else
+	return "";
+#endif
+}
+
+} // namespace duckdb
+
+extern "C" {
+
+DUCKDB_CPP_EXTENSION_ENTRY(common_crawl, loader) {
+	duckdb::LoadInternal(loader);
+}
+}
