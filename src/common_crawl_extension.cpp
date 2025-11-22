@@ -448,7 +448,7 @@ static unique_ptr<FunctionData> CommonCrawlBind(ClientContext &context, TableFun
 	bind_data->fields_needed.push_back("url");
 
 	names.push_back("timestamp");
-	return_types.push_back(LogicalType::TIMESTAMP);
+	return_types.push_back(LogicalType::TIMESTAMP_TZ);
 	bind_data->fields_needed.push_back("timestamp");
 
 	names.push_back("mime_type");
