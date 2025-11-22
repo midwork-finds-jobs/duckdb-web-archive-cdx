@@ -8,7 +8,7 @@ LOAD 'build/debug/extension/common_crawl/common_crawl.duckdb_extension';
 CALL enable_logging('HTTP');
 
 SELECT url, timestamp, response
-FROM common_crawl_index()
+FROM common_crawl_index(2)
 WHERE crawl_id IN ('CC-MAIN-2025-43', 'CC-MAIN-2025-38')
   AND url LIKE '%.teamtailor.com/%'
   AND status_code = 200

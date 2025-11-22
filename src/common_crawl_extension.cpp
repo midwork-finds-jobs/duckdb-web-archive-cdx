@@ -309,17 +309,24 @@ static vector<CDXRecord> QueryCDXAPI(ClientContext &context, const string &index
 	return records;
 }
 
-// Helper function to parse WARC format and extract HTTP response body
-static string ParseWARCResponse(const string &warc_data) {
-	// WARC format has headers followed by HTTP response
-	// We want to extract just the HTTP response body (skip both WARC and HTTP headers)
+// Structure to hold parsed WARC response
+struct WARCResponse {
+	string headers;
+	string body;
+};
+
+// Helper function to parse WARC format and extract HTTP response headers and body
+static WARCResponse ParseWARCResponse(const string &warc_data) {
+	WARCResponse result;
+
+	// WARC format has WARC headers followed by HTTP response (which has HTTP headers + body)
 
 	// Find the end of WARC headers (double newline)
 	size_t warc_headers_end = warc_data.find("\r\n\r\n");
 	if (warc_headers_end == string::npos) {
 		warc_headers_end = warc_data.find("\n\n");
 		if (warc_headers_end == string::npos) {
-			return ""; // Invalid WARC format
+			return result; // Invalid WARC format - return empty
 		}
 		warc_headers_end += 2;
 	} else {
@@ -328,19 +335,25 @@ static string ParseWARCResponse(const string &warc_data) {
 
 	// After WARC headers comes the HTTP response
 	// Find the end of HTTP headers (double newline)
-	size_t http_headers_end = warc_data.find("\r\n\r\n", warc_headers_end);
+	size_t http_headers_start = warc_headers_end;
+	size_t http_headers_end = warc_data.find("\r\n\r\n", http_headers_start);
 	if (http_headers_end == string::npos) {
-		http_headers_end = warc_data.find("\n\n", warc_headers_end);
+		http_headers_end = warc_data.find("\n\n", http_headers_start);
 		if (http_headers_end == string::npos) {
-			return ""; // Invalid HTTP format
+			return result; // Invalid HTTP format - return empty
 		}
 		http_headers_end += 2;
 	} else {
 		http_headers_end += 4;
 	}
 
-	// Return the HTTP body
-	return warc_data.substr(http_headers_end);
+	// Extract HTTP headers (from after WARC headers to before body)
+	result.headers = warc_data.substr(http_headers_start, http_headers_end - http_headers_start);
+
+	// Extract HTTP body
+	result.body = warc_data.substr(http_headers_end);
+
+	return result;
 }
 
 // Helper function to decompress gzip data using zlib
@@ -390,9 +403,11 @@ static string DecompressGzip(const char *compressed_data, size_t compressed_size
 }
 
 // Helper function to fetch WARC response using FileSystem API
-static string FetchWARCResponse(ClientContext &context, const CDXRecord &record) {
+static WARCResponse FetchWARCResponse(ClientContext &context, const CDXRecord &record) {
+	WARCResponse result;
+
 	if (record.filename.empty() || record.offset == 0 || record.length == 0) {
-		return ""; // Invalid record
+		return result; // Invalid record - return empty
 	}
 
 	try {
@@ -414,28 +429,33 @@ static string FetchWARCResponse(ClientContext &context, const CDXRecord &record)
 		int64_t bytes_read = file_handle->Read(buffer.get(), record.length);
 
 		if (bytes_read <= 0) {
-			return "[Error: Failed to read data from WARC file]";
+			result.body = "[Error: Failed to read data from WARC file]";
+			return result;
 		}
 
 		// The data we read is gzip compressed
 		// We need to decompress it to get the WARC content
 		string decompressed = DecompressGzip(buffer.get(), bytes_read);
 
-		// Parse the WARC format to extract just the HTTP response body
-		if (decompressed.find("[") == 0) {
-			// If decompression returned an error message, return it
-			return decompressed;
+		// Parse the WARC format to extract HTTP response headers and body
+		if (decompressed.find("[Error") == 0) {
+			// If decompression returned an error message, put it in body
+			result.body = decompressed;
+			return result;
 		}
 
 		return ParseWARCResponse(decompressed);
 
 	} catch (Exception &ex) {
-		// Return error message for debugging
-		return "[Error fetching WARC: " + string(ex.what()) + "]";
+		// Return error message in body for debugging
+		result.body = "[Error fetching WARC: " + string(ex.what()) + "]";
+		return result;
 	} catch (std::exception &ex) {
-		return "[Error fetching WARC: " + string(ex.what()) + "]";
+		result.body = "[Error fetching WARC: " + string(ex.what()) + "]";
+		return result;
 	} catch (...) {
-		return "[Unknown error fetching WARC]";
+		result.body = "[Unknown error fetching WARC]";
+		return result;
 	}
 }
 
@@ -503,9 +523,14 @@ static unique_ptr<FunctionData> CommonCrawlBind(ClientContext &context, TableFun
 	names.push_back("crawl_id");
 	return_types.push_back(LogicalType::VARCHAR);
 
-	// Add response column (optional - will be NULL if not fetched)
+	// Add response_headers column (HTTP headers from WARC)
+	// Using VARCHAR for headers (text content)
+	names.push_back("response_headers");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	// Add response_body column (HTTP body from WARC)
 	// Using BLOB type to handle binary content (PDFs, images, etc.)
-	names.push_back("response");
+	names.push_back("response_body");
 	return_types.push_back(LogicalType::BLOB);
 
 	// Enable response fetching (implemented with HTTP range requests + gzip decompression)
@@ -551,16 +576,16 @@ static unique_ptr<GlobalTableFunctionState> CommonCrawlInitGlobal(ClientContext 
 			string col_name = bind_data.column_names[col_id];
 			fprintf(stderr, "[DEBUG] Column %lu = %s\n", (unsigned long)col_id, col_name.c_str());
 
-			if (col_name == "response") {
+			if (col_name == "response_headers" || col_name == "response_body") {
 				need_response = true;
 				need_warc = true; // Response requires filename/offset/length
 			} else if (col_name == "filename" || col_name == "offset" || col_name == "length") {
 				need_warc = true;
 			}
 
-			// Add all selected columns to needed_fields (except response and crawl_id which are computed)
-			// crawl_id is not a CDX field - it's populated from index_name parameter
-			if (col_name != "response" && col_name != "crawl_id") {
+			// Add all selected columns to needed_fields (except response_headers, response_body, and crawl_id which are computed)
+			// crawl_id, response_headers, response_body are not CDX fields - they're populated by our code
+			if (col_name != "response_headers" && col_name != "response_body" && col_name != "crawl_id") {
 				needed_fields.push_back(col_name);
 			}
 		}
@@ -718,12 +743,20 @@ static void CommonCrawlScan(ClientContext &context, TableFunctionInput &data, Da
 				} else if (col_name == "crawl_id") {
 					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
 					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], record.crawl_id);
-				} else if (col_name == "response") {
+				} else if (col_name == "response_headers" || col_name == "response_body") {
 					if (bind_data.fetch_response) {
-						string response = FetchWARCResponse(context, record);
+						WARCResponse warc_response = FetchWARCResponse(context, record);
 						auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
-						// Use AddStringOrBlob for binary data (no UTF-8 validation)
-						data_ptr[output_offset] = StringVector::AddStringOrBlob(output.data[proj_idx], response);
+
+						if (col_name == "response_headers") {
+							// Headers are text, use AddString with UTF-8 validation
+							data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx],
+							                                                    SanitizeUTF8(warc_response.headers));
+						} else {
+							// Body can be binary (images, PDFs, etc.), use AddStringOrBlob
+							data_ptr[output_offset] = StringVector::AddStringOrBlob(output.data[proj_idx],
+							                                                         warc_response.body);
+						}
 					} else {
 						FlatVector::SetNull(output.data[proj_idx], output_offset, true);
 					}
