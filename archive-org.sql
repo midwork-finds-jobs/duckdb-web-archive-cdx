@@ -1,7 +1,7 @@
 SET autoinstall_known_extensions=1;
 SET autoload_known_extensions=1;
 
-FROM internet_archive(max_results := 10)
+FROM internet_archive()
 WHERE url = 'archive.org'
 AND status_code = 200
 LIMIT 5;

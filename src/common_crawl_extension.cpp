@@ -1614,6 +1614,31 @@ static void InternetArchiveScan(ClientContext &context, TableFunctionInput &data
 	auto &bind_data = data.bind_data->Cast<InternetArchiveBindData>();
 	auto &gstate = data.global_state->Cast<InternetArchiveGlobalState>();
 
+	// Pre-fetch responses in parallel for this chunk if needed
+	std::vector<string> response_bodies;
+	idx_t chunk_size = std::min<idx_t>(STANDARD_VECTOR_SIZE, gstate.records.size() - gstate.current_position);
+
+	if (bind_data.fetch_response && chunk_size > 0) {
+		fprintf(stderr, "[DEBUG] Pre-fetching %lu archived pages in parallel\n", (unsigned long)chunk_size);
+		std::vector<std::future<string>> response_futures;
+		response_futures.reserve(chunk_size);
+
+		// Launch parallel fetches
+		for (idx_t i = 0; i < chunk_size; i++) {
+			auto &record = gstate.records[gstate.current_position + i];
+			response_futures.push_back(std::async(std::launch::async, [&context, record]() {
+				return FetchArchivedPage(context, record);
+			}));
+		}
+
+		// Collect results
+		response_bodies.reserve(chunk_size);
+		for (auto &future : response_futures) {
+			response_bodies.push_back(future.get());
+		}
+		fprintf(stderr, "[DEBUG] All %lu archived pages fetched\n", (unsigned long)chunk_size);
+	}
+
 	idx_t output_offset = 0;
 	while (gstate.current_position < gstate.records.size() && output_offset < STANDARD_VECTOR_SIZE) {
 		auto &record = gstate.records[gstate.current_position];
@@ -1646,8 +1671,8 @@ static void InternetArchiveScan(ClientContext &context, TableFunctionInput &data
 					auto data_ptr = FlatVector::GetData<int64_t>(output.data[proj_idx]);
 					data_ptr[output_offset] = record.length;
 				} else if (col_name == "response") {
-					if (bind_data.fetch_response) {
-						string body = FetchArchivedPage(context, record);
+					if (bind_data.fetch_response && !response_bodies.empty()) {
+						string &body = response_bodies[output_offset];
 						auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
 						data_ptr[output_offset] = StringVector::AddStringOrBlob(output.data[proj_idx], body);
 					} else {
