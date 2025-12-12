@@ -173,6 +173,15 @@ true
 statement ok
 SELECT DISTINCT ON(digest) url, digest FROM wayback_machine() WHERE url = 'archive.org' LIMIT 0;
 
+# Test DISTINCT ON with LIMIT pushdown (both collapse and limit should be in URL)
+query II
+SELECT DISTINCT ON(year)
+    cdx_url LIKE '%&collapse=timestamp:4%' AS has_collapse,
+    cdx_url LIKE '%&limit=5%' AS has_limit
+FROM wayback_machine(debug := true) WHERE url = 'archive.org' LIMIT 5;
+----
+true	true
+
 # Test DISTINCT ON(year) adds &collapse=timestamp:4 to CDX URL (no network - collapse covers timestamp)
 query I
 SELECT DISTINCT ON(year) cdx_url LIKE '%&collapse=timestamp:4%' AS has_year_collapse

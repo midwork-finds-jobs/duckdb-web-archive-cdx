@@ -1308,9 +1308,10 @@ void OptimizeWaybackMachineLimitPushdown(unique_ptr<LogicalOperator> &op) {
 		auto &top_n = op->Cast<LogicalTopN>();
 		reference<LogicalOperator> child = *op->children[0];
 
-		// Skip projection and filter operators to find GET
+		// Skip projection, filter, and distinct operators to find GET
 		while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION ||
-		       child.get().type == LogicalOperatorType::LOGICAL_FILTER) {
+		       child.get().type == LogicalOperatorType::LOGICAL_FILTER ||
+		       child.get().type == LogicalOperatorType::LOGICAL_DISTINCT) {
 			child = *child.get().children[0];
 		}
 
@@ -1354,9 +1355,10 @@ void OptimizeWaybackMachineLimitPushdown(unique_ptr<LogicalOperator> &op) {
 		auto &limit = op->Cast<LogicalLimit>();
 		reference<LogicalOperator> child = *op->children[0];
 
-		// Skip projection and filter operators to find GET
+		// Skip projection, filter, and distinct operators to find GET
 		while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION ||
-		       child.get().type == LogicalOperatorType::LOGICAL_FILTER) {
+		       child.get().type == LogicalOperatorType::LOGICAL_FILTER ||
+		       child.get().type == LogicalOperatorType::LOGICAL_DISTINCT) {
 			child = *child.get().children[0];
 		}
 
