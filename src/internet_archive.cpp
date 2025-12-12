@@ -19,27 +19,39 @@ namespace duckdb {
 // BIND DATA AND STATE
 // ========================================
 
+// Response fetch result with body and optional error
+struct FetchResult {
+	string body;
+	string error; // Empty if successful, error message otherwise
+};
+
 // Structure to hold bind data for wayback_machine table function
 struct WaybackMachineBindData : public TableFunctionData {
 	vector<string> column_names;
 	vector<LogicalType> column_types;
 	vector<string> fields_needed;
 	bool fetch_response;
-	bool cdx_url_only;  // True if only cdx_url column is selected (skip network request)
+	bool cdx_url_only; // True if only cdx_url column is selected (skip network request)
 	string url_filter;
-	string match_type; // exact, prefix, host, domain
-	vector<string> cdx_filters; // filter=field:regex
-	string from_date; // YYYYMMDDhhmmss
-	string to_date;   // YYYYMMDDhhmmss
-	idx_t max_results; // Default limit
-	string collapse;  // collapse parameter (e.g., "urlkey", "timestamp:8")
-	string cdx_url;   // The constructed CDX API URL (populated after query)
-	bool fast_latest; // Use fastLatest=true for efficient ORDER BY timestamp DESC
-	bool order_desc;  // ORDER BY timestamp DESC detected
-	idx_t offset;     // offset parameter for pagination
-	bool debug;       // Show cdx_url column when true
+	string match_type;                                      // exact, prefix, host, domain
+	vector<string> cdx_filters;                             // filter=field:regex
+	string from_date;                                       // YYYYMMDDhhmmss
+	string to_date;                                         // YYYYMMDDhhmmss
+	idx_t max_results;                                      // Default limit
+	string collapse;                                        // collapse parameter (e.g., "urlkey", "timestamp:8")
+	string cdx_url;                                         // The constructed CDX API URL (populated after query)
+	bool fast_latest;                                       // Use fastLatest=true for efficient ORDER BY timestamp DESC
+	bool order_desc;                                        // ORDER BY timestamp DESC detected
+	idx_t offset;                                           // offset parameter for pagination
+	bool debug;                                             // Show cdx_url column when true
+	int timeout_seconds;                                    // Timeout for fetch operations (default 180)
+	std::chrono::steady_clock::time_point fetch_start_time; // Track fetch start time
 
-	WaybackMachineBindData() : fetch_response(false), cdx_url_only(false), url_filter("*"), match_type("exact"), max_results(100), collapse(""), cdx_url(""), fast_latest(false), order_desc(false), offset(0), debug(false) {}
+	WaybackMachineBindData()
+	    : fetch_response(false), cdx_url_only(false), url_filter("*"), match_type("exact"), max_results(100),
+	      collapse(""), cdx_url(""), fast_latest(false), order_desc(false), offset(0), debug(false),
+	      timeout_seconds(180) {
+	}
 };
 
 // Structure to hold global state for wayback_machine table function
@@ -48,7 +60,8 @@ struct WaybackMachineGlobalState : public GlobalTableFunctionState {
 	idx_t current_position;
 	vector<column_t> column_ids;
 
-	WaybackMachineGlobalState() : current_position(0) {}
+	WaybackMachineGlobalState() : current_position(0) {
+	}
 
 	idx_t MaxThreads() const override {
 		return 1; // Single-threaded
@@ -61,9 +74,9 @@ struct WaybackMachineGlobalState : public GlobalTableFunctionState {
 
 // Helper function to build Internet Archive CDX URL (without making request)
 static string BuildArchiveOrgCDXUrl(const string &url_pattern, const string &match_type,
-                                     const vector<string> &fields_needed, const vector<string> &cdx_filters,
-                                     const string &from_date, const string &to_date, idx_t max_results,
-                                     const string &collapse, bool fast_latest, idx_t offset) {
+                                    const vector<string> &fields_needed, const vector<string> &cdx_filters,
+                                    const string &from_date, const string &to_date, idx_t max_results,
+                                    const string &collapse, bool fast_latest, idx_t offset) {
 	// Construct field list for &fl= parameter from fields_needed
 	std::set<string> needed_set(fields_needed.begin(), fields_needed.end());
 
@@ -72,14 +85,14 @@ static string BuildArchiveOrgCDXUrl(const string &url_pattern, const string &mat
 	vector<string> ordered_fields = {"urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"};
 	for (const auto &f : ordered_fields) {
 		if (needed_set.count(f)) {
-			if (!field_list.empty()) field_list += ",";
+			if (!field_list.empty())
+				field_list += ",";
 			field_list += f;
 		}
 	}
 
 	// Construct the CDX API URL (use CSV format - space delimited, fields in fl order)
-	string cdx_url = "https://web.archive.org/cdx/search/cdx?url=" + url_pattern +
-	                 "&output=csv&fl=" + field_list;
+	string cdx_url = "https://web.archive.org/cdx/search/cdx?url=" + url_pattern + "&output=csv&fl=" + field_list;
 
 	// Add matchType if not exact (default)
 	if (match_type != "exact") {
@@ -125,16 +138,16 @@ static string BuildArchiveOrgCDXUrl(const string &url_pattern, const string &mat
 
 // Helper function to query Internet Archive CDX API
 static vector<ArchiveOrgRecord> QueryArchiveOrgCDX(ClientContext &context, const string &url_pattern,
-                                                     const string &match_type, const vector<string> &fields_needed,
-                                                     const vector<string> &cdx_filters, const string &from_date,
-                                                     const string &to_date, idx_t max_results, const string &collapse,
-                                                     bool fast_latest, idx_t offset, string &out_cdx_url) {
+                                                   const string &match_type, const vector<string> &fields_needed,
+                                                   const vector<string> &cdx_filters, const string &from_date,
+                                                   const string &to_date, idx_t max_results, const string &collapse,
+                                                   bool fast_latest, idx_t offset, string &out_cdx_url) {
 	DUCKDB_LOG_DEBUG(context, "QueryArchiveOrgCDX started +%.0fms", ElapsedMs());
 	vector<ArchiveOrgRecord> records;
 
 	// Build the CDX URL
-	string cdx_url = BuildArchiveOrgCDXUrl(url_pattern, match_type, fields_needed, cdx_filters,
-	                                        from_date, to_date, max_results, collapse, fast_latest, offset);
+	string cdx_url = BuildArchiveOrgCDXUrl(url_pattern, match_type, fields_needed, cdx_filters, from_date, to_date,
+	                                       max_results, collapse, fast_latest, offset);
 
 	// Construct field list for parsing (same logic as BuildArchiveOrgCDXUrl)
 	std::set<string> needed_set(fields_needed.begin(), fields_needed.end());
@@ -142,7 +155,8 @@ static vector<ArchiveOrgRecord> QueryArchiveOrgCDX(ClientContext &context, const
 	vector<string> ordered_fields = {"urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"};
 	for (const auto &f : ordered_fields) {
 		if (needed_set.count(f)) {
-			if (!field_list.empty()) field_list += ",";
+			if (!field_list.empty())
+				field_list += ",";
 			field_list += f;
 		}
 	}
@@ -203,7 +217,7 @@ static vector<ArchiveOrgRecord> QueryArchiveOrgCDX(ClientContext &context, const
 			}
 
 			if (values.size() < fields_in_order.size()) {
-				continue;  // Skip malformed lines
+				continue; // Skip malformed lines
 			}
 
 			// Parse data row using known field order
@@ -243,10 +257,14 @@ static vector<ArchiveOrgRecord> QueryArchiveOrgCDX(ClientContext &context, const
 // ARCHIVED PAGE FETCHING
 // ========================================
 
-// Helper function to fetch archived page from Internet Archive with retry
-static string FetchArchivedPage(ClientContext &context, const ArchiveOrgRecord &record) {
+// Helper function to fetch archived page from Internet Archive with retry and timeout
+static FetchResult FetchArchivedPage(ClientContext &context, const ArchiveOrgRecord &record,
+                                     std::chrono::steady_clock::time_point start_time, int timeout_seconds) {
+	FetchResult result;
+
 	if (record.timestamp.empty() || record.original.empty()) {
-		return "[Error: Missing timestamp or URL]";
+		result.error = "Missing timestamp or URL";
+		return result;
 	}
 
 	// Construct the download URL with id_ suffix to get raw content
@@ -258,9 +276,19 @@ static string FetchArchivedPage(ClientContext &context, const ArchiveOrgRecord &
 	string last_error;
 
 	for (int attempt = 0; attempt < max_retries; attempt++) {
+		// Check if timeout exceeded
+		auto elapsed =
+		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
+		if (elapsed >= timeout_seconds) {
+			result.error = "Timeout after " + to_string(elapsed) + "s (limit: " + to_string(timeout_seconds) + "s)";
+			DUCKDB_LOG_DEBUG(context, "Fetch timeout for: %s", download_url.c_str());
+			return result;
+		}
+
 		try {
 			if (attempt > 0) {
-				DUCKDB_LOG_DEBUG(context, "Retry %d/%d after %dms for: %s", attempt, max_retries - 1, retry_delay_ms / 2, download_url.c_str());
+				DUCKDB_LOG_DEBUG(context, "Retry %d/%d after %dms for: %s", attempt, max_retries - 1,
+				                 retry_delay_ms / 2, download_url.c_str());
 				std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms));
 				retry_delay_ms *= 2; // Exponential backoff
 			} else {
@@ -286,18 +314,32 @@ static string FetchArchivedPage(ClientContext &context, const ArchiveOrgRecord &
 				response_data.append(buffer.get(), bytes_read);
 			}
 
-			return response_data;
+			result.body = response_data;
+			return result; // Success - error is empty
 
 		} catch (Exception &ex) {
 			last_error = ex.what();
-			// Continue to retry on connection errors
+			// Check for retryable HTTP errors (503, 504)
+			string error_str = last_error;
+			bool is_retryable = error_str.find("503") != string::npos || error_str.find("504") != string::npos ||
+			                    error_str.find("Service Unavailable") != string::npos ||
+			                    error_str.find("Gateway Timeout") != string::npos ||
+			                    error_str.find("connection") != string::npos ||
+			                    error_str.find("timeout") != string::npos;
+			if (!is_retryable && attempt == 0) {
+				// Non-retryable error on first attempt, fail immediately
+				result.error = last_error;
+				return result;
+			}
+			// Continue to retry on retryable errors
 		} catch (std::exception &ex) {
 			last_error = ex.what();
 			// Continue to retry on connection errors
 		}
 	}
 
-	return "[Error fetching archived page after " + to_string(max_retries) + " retries: " + last_error + "]";
+	result.error = "Failed after " + to_string(max_retries) + " retries: " + last_error;
+	return result;
 }
 
 // ========================================
@@ -306,7 +348,7 @@ static string FetchArchivedPage(ClientContext &context, const ArchiveOrgRecord &
 
 // Bind function for wayback_machine table function
 static unique_ptr<FunctionData> WaybackMachineBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
 	g_start_time = std::chrono::steady_clock::now();
 	DUCKDB_LOG_DEBUG(context, "WaybackMachineBind called +%.0fms", ElapsedMs());
 
@@ -332,6 +374,12 @@ static unique_ptr<FunctionData> WaybackMachineBind(ClientContext &context, Table
 			}
 			bind_data->debug = kv.second.GetValue<bool>();
 			DUCKDB_LOG_DEBUG(context, "Debug mode: %s", bind_data->debug ? "true" : "false");
+		} else if (kv.first == "timeout") {
+			if (kv.second.type().id() != LogicalTypeId::BIGINT && kv.second.type().id() != LogicalTypeId::INTEGER) {
+				throw BinderException("wayback_machine timeout parameter must be an integer (seconds)");
+			}
+			bind_data->timeout_seconds = kv.second.GetValue<int64_t>();
+			DUCKDB_LOG_DEBUG(context, "Timeout set to: %d seconds", bind_data->timeout_seconds);
 		} else {
 			throw BinderException("Unknown parameter '%s' for wayback_machine", kv.first.c_str());
 		}
@@ -366,10 +414,11 @@ static unique_ptr<FunctionData> WaybackMachineBind(ClientContext &context, Table
 	return_types.push_back(LogicalType::BIGINT);
 	bind_data->fields_needed.push_back("length");
 
-	// Add response column as STRUCT with body field (consistent with common_crawl_index)
+	// Add response column as STRUCT with body and error fields
 	names.push_back("response");
 	child_list_t<LogicalType> response_children;
 	response_children.push_back(make_pair("body", LogicalType::BLOB));
+	response_children.push_back(make_pair("error", LogicalType::VARCHAR));
 	return_types.push_back(LogicalType::STRUCT(response_children));
 
 	// Add archive_url column (Wayback Machine playback URL)
@@ -392,13 +441,14 @@ static unique_ptr<FunctionData> WaybackMachineBind(ClientContext &context, Table
 
 // Init global state function for wayback_machine
 static unique_ptr<GlobalTableFunctionState> WaybackMachineInitGlobal(ClientContext &context,
-                                                                        TableFunctionInitInput &input) {
+                                                                     TableFunctionInitInput &input) {
 	DUCKDB_LOG_DEBUG(context, "WaybackMachineInitGlobal called +%.0fms", ElapsedMs());
-	auto &bind_data = const_cast<WaybackMachineBindData&>(input.bind_data->Cast<WaybackMachineBindData>());
+	auto &bind_data = const_cast<WaybackMachineBindData &>(input.bind_data->Cast<WaybackMachineBindData>());
 
 	// Validate URL filter - don't allow queries without a specific URL
 	if (bind_data.url_filter == "*" || bind_data.url_filter.empty()) {
-		throw InvalidInputException("wayback_machine() requires a URL filter. Use WHERE url = 'example.com', WHERE url LIKE 'example.com/%', or WHERE url LIKE '%.example.com' for subdomains");
+		throw InvalidInputException("wayback_machine() requires a URL filter. Use WHERE url = 'example.com', WHERE url "
+		                            "LIKE 'example.com/%', or WHERE url LIKE '%.example.com' for subdomains");
 	}
 
 	auto state = make_uniq<WaybackMachineGlobalState>();
@@ -433,10 +483,12 @@ static unique_ptr<GlobalTableFunctionState> WaybackMachineInitGlobal(ClientConte
 				DUCKDB_LOG_DEBUG(context, "Will fetch response bodies");
 			} else if (col_name == "archive_url") {
 				// archive_url needs timestamp and original (url) fields
-				if (std::find(bind_data.fields_needed.begin(), bind_data.fields_needed.end(), "timestamp") == bind_data.fields_needed.end()) {
+				if (std::find(bind_data.fields_needed.begin(), bind_data.fields_needed.end(), "timestamp") ==
+				    bind_data.fields_needed.end()) {
 					bind_data.fields_needed.push_back("timestamp");
 				}
-				if (std::find(bind_data.fields_needed.begin(), bind_data.fields_needed.end(), "original") == bind_data.fields_needed.end()) {
+				if (std::find(bind_data.fields_needed.begin(), bind_data.fields_needed.end(), "original") ==
+				    bind_data.fields_needed.end()) {
 					bind_data.fields_needed.push_back("original");
 				}
 			} else if (col_name == "cdx_url") {
@@ -451,10 +503,10 @@ static unique_ptr<GlobalTableFunctionState> WaybackMachineInitGlobal(ClientConte
 	if (bind_data.cdx_url_only) {
 		// Only cdx_url is selected - build URL without network request
 		DUCKDB_LOG_DEBUG(context, "Only cdx_url selected (debug mode) - skipping network request");
-		bind_data.cdx_url = BuildArchiveOrgCDXUrl(bind_data.url_filter, bind_data.match_type,
-		                                           bind_data.fields_needed, bind_data.cdx_filters,
-		                                           bind_data.from_date, bind_data.to_date, bind_data.max_results,
-		                                           bind_data.collapse, bind_data.fast_latest, bind_data.offset);
+		bind_data.cdx_url =
+		    BuildArchiveOrgCDXUrl(bind_data.url_filter, bind_data.match_type, bind_data.fields_needed,
+		                          bind_data.cdx_filters, bind_data.from_date, bind_data.to_date, bind_data.max_results,
+		                          bind_data.collapse, bind_data.fast_latest, bind_data.offset);
 		DUCKDB_LOG_DEBUG(context, "CDX URL +%.0fms: %s", ElapsedMs(), bind_data.cdx_url.c_str());
 
 		// Create a single dummy record so we return one row with the cdx_url
@@ -462,13 +514,14 @@ static unique_ptr<GlobalTableFunctionState> WaybackMachineInitGlobal(ClientConte
 		state->records.push_back(dummy);
 	} else {
 		// Query Internet Archive CDX API
-		state->records = QueryArchiveOrgCDX(context, bind_data.url_filter, bind_data.match_type,
-		                                     bind_data.fields_needed, bind_data.cdx_filters,
-		                                     bind_data.from_date, bind_data.to_date, bind_data.max_results,
-		                                     bind_data.collapse, bind_data.fast_latest, bind_data.offset, bind_data.cdx_url);
+		state->records =
+		    QueryArchiveOrgCDX(context, bind_data.url_filter, bind_data.match_type, bind_data.fields_needed,
+		                       bind_data.cdx_filters, bind_data.from_date, bind_data.to_date, bind_data.max_results,
+		                       bind_data.collapse, bind_data.fast_latest, bind_data.offset, bind_data.cdx_url);
 	}
 
-	DUCKDB_LOG_DEBUG(context, "QueryArchiveOrgCDX returned %lu records +%.0fms", (unsigned long)state->records.size(), ElapsedMs());
+	DUCKDB_LOG_DEBUG(context, "QueryArchiveOrgCDX returned %lu records +%.0fms", (unsigned long)state->records.size(),
+	                 ElapsedMs());
 
 	return std::move(state);
 }
@@ -479,26 +532,30 @@ static void WaybackMachineScan(ClientContext &context, TableFunctionInput &data,
 	auto &gstate = data.global_state->Cast<WaybackMachineGlobalState>();
 
 	// Pre-fetch responses in parallel for this chunk if needed
-	std::vector<string> response_bodies;
+	std::vector<FetchResult> response_results;
 	idx_t chunk_size = std::min<idx_t>(STANDARD_VECTOR_SIZE, gstate.records.size() - gstate.current_position);
 
 	if (bind_data.fetch_response && chunk_size > 0) {
 		DUCKDB_LOG_DEBUG(context, "Pre-fetching %lu archived pages in parallel", (unsigned long)chunk_size);
-		std::vector<std::future<string>> response_futures;
+		std::vector<std::future<FetchResult>> response_futures;
 		response_futures.reserve(chunk_size);
+
+		// Record start time for timeout tracking
+		auto fetch_start = std::chrono::steady_clock::now();
+		int timeout = bind_data.timeout_seconds;
 
 		// Launch parallel fetches
 		for (idx_t i = 0; i < chunk_size; i++) {
 			auto &record = gstate.records[gstate.current_position + i];
-			response_futures.push_back(std::async(std::launch::async, [&context, record]() {
-				return FetchArchivedPage(context, record);
+			response_futures.push_back(std::async(std::launch::async, [&context, record, fetch_start, timeout]() {
+				return FetchArchivedPage(context, record, fetch_start, timeout);
 			}));
 		}
 
 		// Collect results
-		response_bodies.reserve(chunk_size);
+		response_results.reserve(chunk_size);
 		for (auto &future : response_futures) {
-			response_bodies.push_back(future.get());
+			response_results.push_back(future.get());
 		}
 		DUCKDB_LOG_DEBUG(context, "All %lu archived pages fetched", (unsigned long)chunk_size);
 	}
@@ -515,35 +572,47 @@ static void WaybackMachineScan(ClientContext &context, TableFunctionInput &data,
 			try {
 				if (col_name == "url") {
 					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
-					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.original));
+					data_ptr[output_offset] =
+					    StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.original));
 				} else if (col_name == "timestamp") {
 					auto data_ptr = FlatVector::GetData<timestamp_t>(output.data[proj_idx]);
 					data_ptr[output_offset] = ParseCDXTimestamp(record.timestamp);
 				} else if (col_name == "urlkey") {
 					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
-					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.urlkey));
+					data_ptr[output_offset] =
+					    StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.urlkey));
 				} else if (col_name == "mimetype") {
 					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
-					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.mime_type));
+					data_ptr[output_offset] =
+					    StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.mime_type));
 				} else if (col_name == "statuscode") {
 					auto data_ptr = FlatVector::GetData<int32_t>(output.data[proj_idx]);
 					data_ptr[output_offset] = record.status_code;
 				} else if (col_name == "digest") {
 					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
-					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.digest));
+					data_ptr[output_offset] =
+					    StringVector::AddString(output.data[proj_idx], SanitizeUTF8(record.digest));
 				} else if (col_name == "length") {
 					auto data_ptr = FlatVector::GetData<int64_t>(output.data[proj_idx]);
 					data_ptr[output_offset] = record.length;
 				} else if (col_name == "response") {
-					if (bind_data.fetch_response && !response_bodies.empty()) {
-						string &body = response_bodies[output_offset];
-						// Response STRUCT with body field
+					if (bind_data.fetch_response && !response_results.empty()) {
+						FetchResult &result = response_results[output_offset];
+						// Response STRUCT with body and error fields
 						auto &struct_vector = output.data[proj_idx];
 						auto &struct_children = StructVector::GetEntries(struct_vector);
 						// Child 0: body (BLOB)
 						auto &body_vector = struct_children[0];
 						auto body_data = FlatVector::GetData<string_t>(*body_vector);
-						body_data[output_offset] = StringVector::AddStringOrBlob(*body_vector, body);
+						body_data[output_offset] = StringVector::AddStringOrBlob(*body_vector, result.body);
+						// Child 1: error (VARCHAR)
+						auto &error_vector = struct_children[1];
+						auto error_data = FlatVector::GetData<string_t>(*error_vector);
+						if (result.error.empty()) {
+							FlatVector::SetNull(*error_vector, output_offset, true);
+						} else {
+							error_data[output_offset] = StringVector::AddString(*error_vector, result.error);
+						}
 					} else {
 						FlatVector::SetNull(output.data[proj_idx], output_offset, true);
 					}
@@ -596,9 +665,8 @@ static string SqlRegexToJavaRegex(const string &sql_regex) {
 static string EscapeRegex(const string &val) {
 	string escaped;
 	for (char c : val) {
-		if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' ||
-		    c == '{' || c == '}' || c == '+' || c == '?' || c == '^' ||
-		    c == '$' || c == '|' || c == '\\' || c == '*') {
+		if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' ||
+		    c == '^' || c == '$' || c == '|' || c == '\\' || c == '*') {
 			escaped += '\\';
 		}
 		escaped += c;
@@ -609,21 +677,21 @@ static string EscapeRegex(const string &val) {
 // Helper to check if column supports CDX regex and add filter
 // Returns true if filter was added
 static bool TryAddCdxRegexFilter(ClientContext &context, WaybackMachineBindData &bind_data, const string &col_name,
-                                   const string &filter_pattern, const string &debug_label,
-                                   bool negate = false) {
+                                 const string &filter_pattern, const string &debug_label, bool negate = false) {
 	if (CDX_REGEX_COLUMNS.find(col_name) == CDX_REGEX_COLUMNS.end()) {
 		return false;
 	}
 	string filter_str = (negate ? "!" : "") + col_name + ":" + filter_pattern;
 	bind_data.cdx_filters.push_back(filter_str);
-	DUCKDB_LOG_DEBUG(context, "%s %s: %s +%.0fms", col_name.c_str(), debug_label.c_str(), filter_str.c_str(), ElapsedMs());
+	DUCKDB_LOG_DEBUG(context, "%s %s: %s +%.0fms", col_name.c_str(), debug_label.c_str(), filter_str.c_str(),
+	                 ElapsedMs());
 	return true;
 }
 
 // Helper to handle IN expression for CDX columns (statuscode, mimetype)
 // Converts IN (val1, val2, ...) to regex alternation (val1|val2|...)
-static bool TryHandleInExpression(ClientContext &context, WaybackMachineBindData &bind_data, BoundOperatorExpression &op,
-                                    const string &col_name, bool is_integer) {
+static bool TryHandleInExpression(ClientContext &context, WaybackMachineBindData &bind_data,
+                                  BoundOperatorExpression &op, const string &col_name, bool is_integer) {
 	if (CDX_REGEX_COLUMNS.find(col_name) == CDX_REGEX_COLUMNS.end()) {
 		return false;
 	}
@@ -657,7 +725,8 @@ static bool TryHandleInExpression(ClientContext &context, WaybackMachineBindData
 	// Build regex alternation: (val1|val2|val3)
 	string regex_pattern = "(";
 	for (idx_t j = 0; j < values.size(); j++) {
-		if (j > 0) regex_pattern += "|";
+		if (j > 0)
+			regex_pattern += "|";
 		regex_pattern += values[j];
 	}
 	regex_pattern += ")";
@@ -670,8 +739,9 @@ static bool TryHandleInExpression(ClientContext &context, WaybackMachineBindData
 
 // Filter pushdown for wayback_machine
 static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
-                                                   vector<unique_ptr<Expression>> &filters) {
-	DUCKDB_LOG_DEBUG(context, "WaybackMachinePushdownComplexFilter called with %lu filters +%.0fms", (unsigned long)filters.size(), ElapsedMs());
+                                                vector<unique_ptr<Expression>> &filters) {
+	DUCKDB_LOG_DEBUG(context, "WaybackMachinePushdownComplexFilter called with %lu filters +%.0fms",
+	                 (unsigned long)filters.size(), ElapsedMs());
 	auto &bind_data = bind_data_p->Cast<WaybackMachineBindData>();
 
 	// Build column map
@@ -690,8 +760,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 			auto &func = filter->Cast<BoundFunctionExpression>();
 
 			// Handle LIKE for url column - just replace % with * for CDX API
-			if ((func.function.name == "like" || func.function.name == "~~") &&
-			    func.children.size() >= 2 &&
+			if ((func.function.name == "like" || func.function.name == "~~") && func.children.size() >= 2 &&
 			    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 			    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -725,8 +794,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 
 			// Handle NOT LIKE (!~~) for url column -> !original:regex filter
 			// CDX API uses 'original' field name for URL
-			if ((func.function.name == "!~~" || func.function.name == "not_like") &&
-			    func.children.size() >= 2 &&
+			if ((func.function.name == "!~~" || func.function.name == "not_like") && func.children.size() >= 2 &&
 			    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 			    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -739,7 +807,8 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 					string regex_pattern = LikeToRegex(like_pattern);
 					string filter_str = "!original:" + regex_pattern;
 					bind_data.cdx_filters.push_back(filter_str);
-					DUCKDB_LOG_DEBUG(context, "url NOT LIKE: %s -> %s +%.0fms", like_pattern.c_str(), filter_str.c_str(), ElapsedMs());
+					DUCKDB_LOG_DEBUG(context, "url NOT LIKE: %s -> %s +%.0fms", like_pattern.c_str(),
+					                 filter_str.c_str(), ElapsedMs());
 					filters_to_remove.push_back(i);
 					continue;
 				}
@@ -751,15 +820,15 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 					string regex_pattern = LikeToRegex(like_pattern);
 					string filter_str = "!" + col_name + ":" + regex_pattern;
 					bind_data.cdx_filters.push_back(filter_str);
-					DUCKDB_LOG_DEBUG(context, "%s NOT LIKE: %s -> %s +%.0fms", col_name.c_str(), like_pattern.c_str(), filter_str.c_str(), ElapsedMs());
+					DUCKDB_LOG_DEBUG(context, "%s NOT LIKE: %s -> %s +%.0fms", col_name.c_str(), like_pattern.c_str(),
+					                 filter_str.c_str(), ElapsedMs());
 					filters_to_remove.push_back(i);
 					continue;
 				}
 			}
 
 			// Handle suffix() - DuckDB optimizes LIKE '%x' to suffix()
-			if (func.function.name == "suffix" &&
-			    func.children.size() >= 2 &&
+			if (func.function.name == "suffix" && func.children.size() >= 2 &&
 			    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 			    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -789,8 +858,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 			}
 
 			// Handle prefix() - DuckDB optimizes LIKE 'x%' to prefix()
-			if (func.function.name == "prefix" &&
-			    func.children.size() >= 2 &&
+			if (func.function.name == "prefix" && func.children.size() >= 2 &&
 			    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 			    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -817,8 +885,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 			}
 
 			// Handle contains() - DuckDB optimizes LIKE '%x%' to contains()
-			if (func.function.name == "contains" &&
-			    func.children.size() >= 2 &&
+			if (func.function.name == "contains" && func.children.size() >= 2 &&
 			    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 			    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -836,8 +903,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 			}
 
 			// Handle regexp_matches: column ~ 'regex'
-			if ((func.function.name == "regexp_matches" || func.function.name == "~") &&
-			    func.children.size() >= 2 &&
+			if ((func.function.name == "regexp_matches" || func.function.name == "~") && func.children.size() >= 2 &&
 			    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 			    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -855,8 +921,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 			}
 
 			// Handle regexp_full_match: SIMILAR TO converts to this
-			if (func.function.name == "regexp_full_match" &&
-			    func.children.size() >= 2 &&
+			if (func.function.name == "regexp_full_match" && func.children.size() >= 2 &&
 			    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 			    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -873,15 +938,13 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 					continue;
 				}
 			}
-
 		}
 
 		// Handle NOT (OPERATOR_NOT) for urlkey: NOT regexp_matches() or NOT LIKE
 		if (filter->GetExpressionClass() == ExpressionClass::BOUND_OPERATOR &&
 		    filter->type == ExpressionType::OPERATOR_NOT) {
 			auto &op = filter->Cast<BoundOperatorExpression>();
-			if (op.children.size() >= 1 &&
-			    op.children[0]->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			if (op.children.size() >= 1 && op.children[0]->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 
 				auto &inner_func = op.children[0]->Cast<BoundFunctionExpression>();
 
@@ -920,7 +983,8 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 						string regex_pattern = LikeToRegex(like_pattern);
 						string filter_str = "!urlkey:" + regex_pattern;
 						bind_data.cdx_filters.push_back(filter_str);
-						DUCKDB_LOG_DEBUG(context, "urlkey NOT LIKE: %s -> %s +%.0fms", like_pattern.c_str(), filter_str.c_str(), ElapsedMs());
+						DUCKDB_LOG_DEBUG(context, "urlkey NOT LIKE: %s -> %s +%.0fms", like_pattern.c_str(),
+						                 filter_str.c_str(), ElapsedMs());
 						filters_to_remove.push_back(i);
 						continue;
 					}
@@ -931,15 +995,15 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 						string regex_pattern = LikeToRegex(like_pattern);
 						string filter_str = "!original:" + regex_pattern;
 						bind_data.cdx_filters.push_back(filter_str);
-						DUCKDB_LOG_DEBUG(context, "url NOT LIKE: %s -> %s +%.0fms", like_pattern.c_str(), filter_str.c_str(), ElapsedMs());
+						DUCKDB_LOG_DEBUG(context, "url NOT LIKE: %s -> %s +%.0fms", like_pattern.c_str(),
+						                 filter_str.c_str(), ElapsedMs());
 						filters_to_remove.push_back(i);
 						continue;
 					}
 				}
 
 				// NOT suffix(urlkey, 'pattern') -> !urlkey:.*pattern$
-				if (inner_func.function.name == "suffix" &&
-				    inner_func.children.size() >= 2 &&
+				if (inner_func.function.name == "suffix" && inner_func.children.size() >= 2 &&
 				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 				    inner_func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -957,8 +1021,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 				}
 
 				// NOT prefix(urlkey, 'pattern') -> !urlkey:^pattern.*
-				if (inner_func.function.name == "prefix" &&
-				    inner_func.children.size() >= 2 &&
+				if (inner_func.function.name == "prefix" && inner_func.children.size() >= 2 &&
 				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 				    inner_func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -976,8 +1039,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 				}
 
 				// NOT SIMILAR TO -> NOT regexp_full_match
-				if (inner_func.function.name == "regexp_full_match" &&
-				    inner_func.children.size() >= 2 &&
+				if (inner_func.function.name == "regexp_full_match" && inner_func.children.size() >= 2 &&
 				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 				    inner_func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -989,15 +1051,15 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 						string regex_pattern = SqlRegexToJavaRegex(sql_regex);
 						string filter_str = "!urlkey:" + regex_pattern;
 						bind_data.cdx_filters.push_back(filter_str);
-						DUCKDB_LOG_DEBUG(context, "urlkey NOT SIMILAR TO: %s -> %s +%.0fms", sql_regex.c_str(), filter_str.c_str(), ElapsedMs());
+						DUCKDB_LOG_DEBUG(context, "urlkey NOT SIMILAR TO: %s -> %s +%.0fms", sql_regex.c_str(),
+						                 filter_str.c_str(), ElapsedMs());
 						filters_to_remove.push_back(i);
 						continue;
 					}
 				}
 
 				// NOT contains(urlkey/url, 'pattern') -> !urlkey:.*pattern.* or !original:.*pattern.*
-				if (inner_func.function.name == "contains" &&
-				    inner_func.children.size() >= 2 &&
+				if (inner_func.function.name == "contains" && inner_func.children.size() >= 2 &&
 				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
 				    inner_func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 
@@ -1005,14 +1067,14 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 					auto &constant = inner_func.children[1]->Cast<BoundConstantExpression>();
 					string col_name = col_ref.GetName();
 
-					if ((col_name == "urlkey" || col_name == "url") && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+					if ((col_name == "urlkey" || col_name == "url") &&
+					    constant.value.type().id() == LogicalTypeId::VARCHAR) {
 						string contains_val = constant.value.ToString();
 						// Escape regex special chars
 						string escaped;
 						for (char c : contains_val) {
-							if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' ||
-							    c == '{' || c == '}' || c == '+' || c == '?' || c == '^' ||
-							    c == '$' || c == '|' || c == '\\' || c == '*') {
+							if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' ||
+							    c == '+' || c == '?' || c == '^' || c == '$' || c == '|' || c == '\\' || c == '*') {
 								escaped += '\\';
 							}
 							escaped += c;
@@ -1021,7 +1083,8 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 						string cdx_field = (col_name == "url") ? "original" : col_name;
 						string filter_str = "!" + cdx_field + ":.*" + escaped + ".*";
 						bind_data.cdx_filters.push_back(filter_str);
-						DUCKDB_LOG_DEBUG(context, "%s NOT contains: %s +%.0fms", col_name.c_str(), filter_str.c_str(), ElapsedMs());
+						DUCKDB_LOG_DEBUG(context, "%s NOT contains: %s +%.0fms", col_name.c_str(), filter_str.c_str(),
+						                 ElapsedMs());
 						filters_to_remove.push_back(i);
 						continue;
 					}
@@ -1035,8 +1098,7 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 		    filter->type == ExpressionType::COMPARE_IN) {
 			auto &op = filter->Cast<BoundOperatorExpression>();
 			// First child is the column, rest are the values
-			if (op.children.size() >= 2 &&
-			    op.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			if (op.children.size() >= 2 && op.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 
 				auto &col_ref = op.children[0]->Cast<BoundColumnRefExpression>();
 				string col_name = col_ref.GetName();
@@ -1063,7 +1125,8 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 
 					bind_data.from_date = ToCdxTimestamp(lower_const.value.ToString());
 					bind_data.to_date = ToCdxTimestamp(upper_const.value.ToString());
-					DUCKDB_LOG_DEBUG(context, "BETWEEN from=%s to=%s +%.0fms", bind_data.from_date.c_str(), bind_data.to_date.c_str(), ElapsedMs());
+					DUCKDB_LOG_DEBUG(context, "BETWEEN from=%s to=%s +%.0fms", bind_data.from_date.c_str(),
+					                 bind_data.to_date.c_str(), ElapsedMs());
 
 					filters_to_remove.push_back(i);
 					continue;
@@ -1096,9 +1159,8 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 			}
 		}
 		// Handle statuscode filtering
-		if (column_name == "statuscode" &&
-		    (constant.value.type().id() == LogicalTypeId::INTEGER ||
-		     constant.value.type().id() == LogicalTypeId::BIGINT)) {
+		if (column_name == "statuscode" && (constant.value.type().id() == LogicalTypeId::INTEGER ||
+		                                    constant.value.type().id() == LogicalTypeId::BIGINT)) {
 			int32_t val = constant.value.GetValue<int32_t>();
 			if (filter->type == ExpressionType::COMPARE_EQUAL) {
 				string filter_str = "statuscode:" + to_string(val);
@@ -1123,11 +1185,10 @@ static void WaybackMachinePushdownComplexFilter(ClientContext &context, LogicalG
 			}
 		}
 		// Handle timestamp filtering (from/to date range)
-		else if (column_name == "timestamp" &&
-		         (constant.value.type().id() == LogicalTypeId::TIMESTAMP ||
-		          constant.value.type().id() == LogicalTypeId::TIMESTAMP_TZ ||
-		          constant.value.type().id() == LogicalTypeId::DATE ||
-		          constant.value.type().id() == LogicalTypeId::VARCHAR)) {
+		else if (column_name == "timestamp" && (constant.value.type().id() == LogicalTypeId::TIMESTAMP ||
+		                                        constant.value.type().id() == LogicalTypeId::TIMESTAMP_TZ ||
+		                                        constant.value.type().id() == LogicalTypeId::DATE ||
+		                                        constant.value.type().id() == LogicalTypeId::VARCHAR)) {
 
 			string cdx_timestamp = ToCdxTimestamp(constant.value.ToString());
 
@@ -1186,7 +1247,8 @@ static bool IsTimestampDescTopN(LogicalTopN &top_n, const WaybackMachineBindData
 		}
 
 		// Also check by column binding - timestamp is column index 1 in our schema
-		// (url=0, timestamp=1, urlkey=2, mimetype=3, statuscode=4, digest=5, length=6, response=7, archive_url=8, cdx_url=9 if debug)
+		// (url=0, timestamp=1, urlkey=2, mimetype=3, statuscode=4, digest=5, length=6, response=7, archive_url=8,
+		// cdx_url=9 if debug)
 		if (col_ref.binding.column_index == 1) {
 			return true;
 		}
@@ -1326,8 +1388,7 @@ void RegisterWaybackMachineFunction(ExtensionLoader &loader) {
 	// - Optional max_results parameter controls CDX API result size (default: 100)
 	TableFunctionSet wayback_machine_set("wayback_machine");
 
-	auto ia_func = TableFunction({},
-	                              WaybackMachineScan, WaybackMachineBind, WaybackMachineInitGlobal);
+	auto ia_func = TableFunction({}, WaybackMachineScan, WaybackMachineBind, WaybackMachineInitGlobal);
 	ia_func.cardinality = WaybackMachineCardinality;
 	ia_func.pushdown_complex_filter = WaybackMachinePushdownComplexFilter;
 	ia_func.projection_pushdown = true;
@@ -1336,6 +1397,7 @@ void RegisterWaybackMachineFunction(ExtensionLoader &loader) {
 	ia_func.named_parameters["max_results"] = LogicalType::BIGINT;
 	ia_func.named_parameters["collapse"] = LogicalType::VARCHAR;
 	ia_func.named_parameters["debug"] = LogicalType::BOOLEAN;
+	ia_func.named_parameters["timeout"] = LogicalType::BIGINT;
 
 	wayback_machine_set.AddFunction(ia_func);
 

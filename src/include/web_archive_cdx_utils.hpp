@@ -68,14 +68,16 @@ string DecompressGzip(const char *compressed_data, size_t compressed_size);
 
 // Structure to hold parsed WARC response
 struct WARCResponse {
-	string warc_version;                    // e.g., "1.0" from "WARC/1.0"
-	unordered_map<string, string> warc_headers;  // WARC header fields as map
-	string http_version;                    // e.g., "1.1" from "HTTP/1.1"
-	int http_status_code;                   // e.g., 200 from "HTTP/1.1 200"
-	unordered_map<string, string> http_headers;  // HTTP header fields as map
-	string body;                            // HTTP response body
+	string warc_version;                        // e.g., "1.0" from "WARC/1.0"
+	unordered_map<string, string> warc_headers; // WARC header fields as map
+	string http_version;                        // e.g., "1.1" from "HTTP/1.1"
+	int http_status_code;                       // e.g., 200 from "HTTP/1.1 200"
+	unordered_map<string, string> http_headers; // HTTP header fields as map
+	string body;                                // HTTP response body
+	string error;                               // Error message if fetch failed (empty on success)
 
-	WARCResponse() : http_status_code(0) {}
+	WARCResponse() : http_status_code(0) {
+	}
 };
 
 // Helper function to parse headers into a map
@@ -101,7 +103,8 @@ struct CDXRecord {
 	int32_t status_code;
 	string crawl_id;
 
-	CDXRecord() : offset(0), length(0), status_code(0) {}
+	CDXRecord() : offset(0), length(0), status_code(0) {
+	}
 };
 
 // Structure to hold Internet Archive CDX record data
@@ -114,7 +117,8 @@ struct ArchiveOrgRecord {
 	string digest;       // SHA-1 hash
 	int64_t length;      // Content length
 
-	ArchiveOrgRecord() : status_code(0), length(0) {}
+	ArchiveOrgRecord() : status_code(0), length(0) {
+	}
 };
 
 // ========================================
@@ -128,20 +132,23 @@ struct CrawlInfo {
 	timestamp_t from_ts; // Start of crawl period
 	timestamp_t to_ts;   // End of crawl period
 
-	CrawlInfo() : from_ts(timestamp_t(0)), to_ts(timestamp_t(0)) {}
+	CrawlInfo() : from_ts(timestamp_t(0)), to_ts(timestamp_t(0)) {
+	}
 };
 
 // Cache for collinfo.json (1 day TTL)
 struct CollInfoCache {
 	string latest_crawl_id;
-	vector<CrawlInfo> crawl_infos;  // Full list of crawl info with dates
+	vector<CrawlInfo> crawl_infos; // Full list of crawl info with dates
 	std::chrono::system_clock::time_point cached_at;
 	bool is_valid;
 
-	CollInfoCache() : is_valid(false) {}
+	CollInfoCache() : is_valid(false) {
+	}
 
 	bool IsExpired() const {
-		if (!is_valid) return true;
+		if (!is_valid)
+			return true;
 		auto now = std::chrono::system_clock::now();
 		auto age = std::chrono::duration_cast<std::chrono::hours>(now - cached_at).count();
 		return age >= 24; // 1 day = 24 hours

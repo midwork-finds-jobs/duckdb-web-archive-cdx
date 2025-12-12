@@ -41,9 +41,8 @@ string LikeToRegex(const string &like_pattern) {
 			regex += ".*";
 		} else if (c == '_') {
 			regex += ".";
-		} else if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' ||
-		           c == '{' || c == '}' || c == '+' || c == '?' || c == '^' ||
-		           c == '$' || c == '|' || c == '\\') {
+		} else if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' ||
+		           c == '?' || c == '^' || c == '$' || c == '|' || c == '\\') {
 			// Escape regex special chars
 			regex += '\\';
 			regex += c;
@@ -63,7 +62,8 @@ string LikeToRegex(const string &like_pattern) {
 string ToCdxTimestamp(const string &ts_str) {
 	string digits;
 	for (char c : ts_str) {
-		if (c >= '0' && c <= '9') digits += c;
+		if (c >= '0' && c <= '9')
+			digits += c;
 	}
 	// Truncate to 14 chars max
 	if (digits.length() > 14) {
@@ -80,7 +80,7 @@ string SanitizeUTF8(const string &str) {
 	string result;
 	result.reserve(str.size());
 
-	for (size_t i = 0; i < str.size(); ) {
+	for (size_t i = 0; i < str.size();) {
 		unsigned char c = static_cast<unsigned char>(str[i]);
 
 		// ASCII character (0-127)
@@ -92,9 +92,12 @@ string SanitizeUTF8(const string &str) {
 
 		// Multi-byte UTF-8 character
 		int len = 0;
-		if ((c & 0xE0) == 0xC0) len = 2;      // 2-byte
-		else if ((c & 0xF0) == 0xE0) len = 3; // 3-byte
-		else if ((c & 0xF8) == 0xF0) len = 4; // 4-byte
+		if ((c & 0xE0) == 0xC0)
+			len = 2; // 2-byte
+		else if ((c & 0xF0) == 0xE0)
+			len = 3; // 3-byte
+		else if ((c & 0xF8) == 0xF0)
+			len = 4; // 4-byte
 		else {
 			// Invalid start byte, replace with ?
 			result += '?';
@@ -437,11 +440,13 @@ static string ExtractJSONStringField(const string &json, const string &field) {
 		// Try with space after colon
 		search = "\"" + field + "\": \"";
 		start = json.find(search);
-		if (start == string::npos) return "";
+		if (start == string::npos)
+			return "";
 	}
 	start += search.length();
 	size_t end = json.find("\"", start);
-	if (end == string::npos) return "";
+	if (end == string::npos)
+		return "";
 	return json.substr(start, end - start);
 }
 
@@ -465,7 +470,8 @@ static void FetchCollInfo(ClientContext &context) {
 
 	while (true) {
 		int64_t bytes_read = file_handle->Read(buffer.get(), buffer_size);
-		if (bytes_read <= 0) break;
+		if (bytes_read <= 0)
+			break;
 		response_data.append(buffer.get(), bytes_read);
 	}
 
@@ -478,7 +484,8 @@ static void FetchCollInfo(ClientContext &context) {
 	g_collinfo_cache.latest_crawl_id = "";
 
 	// Parse JSON array manually - each entry is an object with id, name, from, to
-	// Format: [{"id": "CC-MAIN-2025-47", "name": "November 2025 Index", "from": "2025-11-06T20:07:18", "to": "2025-11-19T12:34:13", ...}, ...]
+	// Format: [{"id": "CC-MAIN-2025-47", "name": "November 2025 Index", "from": "2025-11-06T20:07:18", "to":
+	// "2025-11-19T12:34:13", ...}, ...]
 	size_t pos = 0;
 	while ((pos = response_data.find("\"id\":", pos)) != string::npos) {
 		// Find the start of this object (go back to find '{')
@@ -490,7 +497,8 @@ static void FetchCollInfo(ClientContext &context) {
 
 		// Find the end of this object - but skip nested braces if any
 		size_t obj_end = response_data.find("}", pos);
-		if (obj_end == string::npos) break;
+		if (obj_end == string::npos)
+			break;
 
 		string obj = response_data.substr(obj_start, obj_end - obj_start + 1);
 
@@ -522,8 +530,8 @@ static void FetchCollInfo(ClientContext &context) {
 	g_collinfo_cache.is_valid = true;
 
 	DUCKDB_LOG_DEBUG(context, "Cached %lu crawl infos, latest: %s +%.0fms",
-	        (unsigned long)g_collinfo_cache.crawl_infos.size(),
-	        g_collinfo_cache.latest_crawl_id.c_str(), ElapsedMs());
+	                 (unsigned long)g_collinfo_cache.crawl_infos.size(), g_collinfo_cache.latest_crawl_id.c_str(),
+	                 ElapsedMs());
 }
 
 string GetLatestCrawlId(ClientContext &context) {
@@ -550,8 +558,8 @@ vector<string> GetCrawlIdsForTimestampRange(ClientContext &context, timestamp_t 
 	bool has_from = from_ts.value != 0;
 	bool has_to = to_ts.value != 0;
 
-	DUCKDB_LOG_DEBUG(context, "Looking for crawls in range: from=%lld to=%lld +%.0fms",
-	        (long long)from_ts.value, (long long)to_ts.value, ElapsedMs());
+	DUCKDB_LOG_DEBUG(context, "Looking for crawls in range: from=%lld to=%lld +%.0fms", (long long)from_ts.value,
+	                 (long long)to_ts.value, ElapsedMs());
 
 	for (const auto &info : crawl_infos) {
 		// A crawl overlaps with the query range if:
@@ -570,13 +578,12 @@ vector<string> GetCrawlIdsForTimestampRange(ClientContext &context, timestamp_t 
 
 		if (overlaps) {
 			matching_ids.push_back(info.id);
-			DUCKDB_LOG_DEBUG(context, "  Matched crawl: %s (from=%lld to=%lld)",
-			        info.id.c_str(), (long long)info.from_ts.value, (long long)info.to_ts.value);
+			DUCKDB_LOG_DEBUG(context, "  Matched crawl: %s (from=%lld to=%lld)", info.id.c_str(),
+			                 (long long)info.from_ts.value, (long long)info.to_ts.value);
 		}
 	}
 
-	DUCKDB_LOG_DEBUG(context, "Found %lu matching crawls +%.0fms",
-	        (unsigned long)matching_ids.size(), ElapsedMs());
+	DUCKDB_LOG_DEBUG(context, "Found %lu matching crawls +%.0fms", (unsigned long)matching_ids.size(), ElapsedMs());
 
 	return matching_ids;
 }
