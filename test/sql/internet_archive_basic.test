@@ -14,15 +14,16 @@ SELECT column_name FROM (
     DESCRIBE SELECT * FROM wayback_machine()
 ) ORDER BY column_name;
 ----
-archive_url
 digest
 length
 mimetype
+month
 response
 statuscode
 timestamp
 url
 urlkey
+year
 
 # Test that cdx_url column is shown when debug := true
 query I
@@ -30,16 +31,17 @@ SELECT column_name FROM (
     DESCRIBE SELECT * FROM wayback_machine(debug := true)
 ) ORDER BY column_name;
 ----
-archive_url
 cdx_url
 digest
 length
 mimetype
+month
 response
 statuscode
 timestamp
 url
 urlkey
+year
 
 # Test column types for basic fields
 query II
@@ -145,17 +147,18 @@ WHERE url = 'archive.org'
 ORDER BY timestamp DESC
 LIMIT 0;
 
-# Test archive_url column type
+# Test year and month column types
 query II
 SELECT column_name, column_type FROM (
-    DESCRIBE SELECT archive_url FROM wayback_machine()
-);
+    DESCRIBE SELECT year, month FROM wayback_machine()
+) ORDER BY column_name;
 ----
-archive_url	VARCHAR
+month	INTEGER
+year	INTEGER
 
-# Test archive_url column is selectable
+# Test year and month columns are selectable
 statement ok
-SELECT archive_url FROM wayback_machine()
+SELECT year, month FROM wayback_machine()
 WHERE url = 'archive.org'
 LIMIT 0;
 

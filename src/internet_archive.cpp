@@ -424,9 +424,13 @@ static unique_ptr<FunctionData> WaybackMachineBind(ClientContext &context, Table
 	response_children.push_back(make_pair("error", LogicalType::VARCHAR));
 	return_types.push_back(LogicalType::STRUCT(response_children));
 
-	// Add archive_url column (Wayback Machine playback URL)
-	names.push_back("archive_url");
-	return_types.push_back(LogicalType::VARCHAR);
+	// Add year column (extracted from timestamp)
+	names.push_back("year");
+	return_types.push_back(LogicalType::INTEGER);
+
+	// Add month column (extracted from timestamp)
+	names.push_back("month");
+	return_types.push_back(LogicalType::INTEGER);
 
 	// Add cdx_url column only when debug := true
 	if (bind_data->debug) {
@@ -484,15 +488,11 @@ static unique_ptr<GlobalTableFunctionState> WaybackMachineInitGlobal(ClientConte
 			} else if (col_name == "response") {
 				bind_data.fetch_response = true;
 				DUCKDB_LOG_DEBUG(context, "Will fetch response bodies");
-			} else if (col_name == "archive_url") {
-				// archive_url needs timestamp and original (url) fields
+			} else if (col_name == "year" || col_name == "month") {
+				// year and month need timestamp field
 				if (std::find(bind_data.fields_needed.begin(), bind_data.fields_needed.end(), "timestamp") ==
 				    bind_data.fields_needed.end()) {
 					bind_data.fields_needed.push_back("timestamp");
-				}
-				if (std::find(bind_data.fields_needed.begin(), bind_data.fields_needed.end(), "original") ==
-				    bind_data.fields_needed.end()) {
-					bind_data.fields_needed.push_back("original");
 				}
 			} else if (col_name == "cdx_url") {
 				// cdx_url doesn't need any CDX fields
@@ -619,11 +619,22 @@ static void WaybackMachineScan(ClientContext &context, TableFunctionInput &data,
 					} else {
 						FlatVector::SetNull(output.data[proj_idx], output_offset, true);
 					}
-				} else if (col_name == "archive_url") {
-					// Construct Wayback Machine playback URL: https://web.archive.org/web/{timestamp}/{url}
-					string archive_url = "https://web.archive.org/web/" + record.timestamp + "/" + record.original;
-					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
-					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], archive_url);
+				} else if (col_name == "year") {
+					// Extract year from timestamp (format: YYYYMMDDhhmmss)
+					auto data_ptr = FlatVector::GetData<int32_t>(output.data[proj_idx]);
+					if (record.timestamp.length() >= 4) {
+						data_ptr[output_offset] = std::stoi(record.timestamp.substr(0, 4));
+					} else {
+						FlatVector::SetNull(output.data[proj_idx], output_offset, true);
+					}
+				} else if (col_name == "month") {
+					// Extract month from timestamp (format: YYYYMMDDhhmmss)
+					auto data_ptr = FlatVector::GetData<int32_t>(output.data[proj_idx]);
+					if (record.timestamp.length() >= 6) {
+						data_ptr[output_offset] = std::stoi(record.timestamp.substr(4, 2));
+					} else {
+						FlatVector::SetNull(output.data[proj_idx], output_offset, true);
+					}
 				} else if (col_name == "cdx_url") {
 					auto data_ptr = FlatVector::GetData<string_t>(output.data[proj_idx]);
 					data_ptr[output_offset] = StringVector::AddString(output.data[proj_idx], bind_data.cdx_url);
@@ -1250,8 +1261,8 @@ static bool IsTimestampDescTopN(LogicalTopN &top_n, const WaybackMachineBindData
 		}
 
 		// Also check by column binding - timestamp is column index 1 in our schema
-		// (url=0, timestamp=1, urlkey=2, mimetype=3, statuscode=4, digest=5, length=6, response=7, archive_url=8,
-		// cdx_url=9 if debug)
+		// (url=0, timestamp=1, urlkey=2, mimetype=3, statuscode=4, digest=5, length=6, response=7, year=8, month=9,
+		// cdx_url=10 if debug)
 		if (col_ref.binding.column_index == 1) {
 			return true;
 		}

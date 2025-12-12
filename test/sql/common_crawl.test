@@ -70,15 +70,16 @@ SELECT column_name FROM (
     DESCRIBE SELECT * FROM wayback_machine()
 ) ORDER BY column_name;
 ----
-archive_url
 digest
 length
 mimetype
+month
 response
 statuscode
 timestamp
 url
 urlkey
+year
 
 # Test named parameters work
 statement ok
