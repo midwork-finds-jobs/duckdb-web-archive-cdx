@@ -1011,8 +1011,8 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 						string regex_pattern = SqlRegexToRegex(like_pattern);
 
 						if (column_name == "url") {
-							// url NOT LIKE -> !url:regex
-							string filter_str = "!url:" + regex_pattern;
+							// url NOT LIKE -> !~url:regex (negated regex match)
+							string filter_str = "!~url:" + regex_pattern;
 							bind_data.cdx_filters.push_back(filter_str);
 							DUCKDB_LOG_DEBUG(context, "url NOT LIKE: '%s' -> %s", like_pattern.c_str(), filter_str.c_str());
 							filters_to_remove.push_back(i);
@@ -1061,7 +1061,7 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 
 				auto &inner_func = op.children[0]->Cast<BoundFunctionExpression>();
 
-				// NOT prefix(url, 'pattern') -> !url:^pattern.*$
+				// NOT prefix(url, 'pattern') -> !~url:^pattern.*$ (negated regex match)
 				if (inner_func.function.name == "prefix" &&
 				    inner_func.children.size() >= 2 &&
 				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
@@ -1074,7 +1074,7 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 					if (column_name == "url" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
 						string prefix_str = constant.value.ToString();
 						string regex_pattern = "^" + EscapeRegexSpecialChars(prefix_str) + ".*$";
-						string filter_str = "!url:" + regex_pattern;
+						string filter_str = "!~url:" + regex_pattern;
 						bind_data.cdx_filters.push_back(filter_str);
 						DUCKDB_LOG_DEBUG(context, "url NOT PREFIX: '%s' -> %s", prefix_str.c_str(), filter_str.c_str());
 						filters_to_remove.push_back(i);
@@ -1082,7 +1082,7 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 					}
 				}
 
-				// NOT like(url, 'pattern') or NOT ~~(url, 'pattern') -> !url:regex
+				// NOT like(url, 'pattern') or NOT ~~(url, 'pattern') -> !~url:regex (negated regex match)
 				if ((inner_func.function.name == "like" || inner_func.function.name == "~~") &&
 				    inner_func.children.size() >= 2 &&
 				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
@@ -1095,7 +1095,7 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 					if (column_name == "url" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
 						string like_pattern = constant.value.ToString();
 						string regex_pattern = SqlRegexToRegex(like_pattern);
-						string filter_str = "!url:" + regex_pattern;
+						string filter_str = "!~url:" + regex_pattern;
 						bind_data.cdx_filters.push_back(filter_str);
 						DUCKDB_LOG_DEBUG(context, "url NOT LIKE (wrapped): '%s' -> %s", like_pattern.c_str(), filter_str.c_str());
 						filters_to_remove.push_back(i);
