@@ -659,6 +659,40 @@ static void InternetArchivePushdownComplexFilter(ClientContext &context, Logical
 				}
 			}
 
+			// Handle NOT LIKE (!~~) for url column -> !original:regex filter
+			// CDX API uses 'original' field name for URL
+			if ((func.function.name == "!~~" || func.function.name == "not_like") &&
+			    func.children.size() >= 2 &&
+			    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+			    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+
+				auto &col_ref = func.children[0]->Cast<BoundColumnRefExpression>();
+				auto &constant = func.children[1]->Cast<BoundConstantExpression>();
+				string col_name = col_ref.GetName();
+
+				if (col_name == "url" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+					string like_pattern = constant.value.ToString();
+					string regex_pattern = LikeToRegex(like_pattern);
+					string filter_str = "!original:" + regex_pattern;
+					bind_data.cdx_filters.push_back(filter_str);
+					fprintf(stderr, "[DEBUG +%.0fms] url NOT LIKE: %s -> %s\n", ElapsedMs(), like_pattern.c_str(), filter_str.c_str());
+					filters_to_remove.push_back(i);
+					continue;
+				}
+
+				// Handle NOT LIKE for CDX regex columns (urlkey, mimetype, statuscode)
+				if (CDX_REGEX_COLUMNS.find(col_name) != CDX_REGEX_COLUMNS.end() &&
+				    constant.value.type().id() == LogicalTypeId::VARCHAR) {
+					string like_pattern = constant.value.ToString();
+					string regex_pattern = LikeToRegex(like_pattern);
+					string filter_str = "!" + col_name + ":" + regex_pattern;
+					bind_data.cdx_filters.push_back(filter_str);
+					fprintf(stderr, "[DEBUG +%.0fms] %s NOT LIKE: %s -> %s\n", ElapsedMs(), col_name.c_str(), like_pattern.c_str(), filter_str.c_str());
+					filters_to_remove.push_back(i);
+					continue;
+				}
+			}
+
 			// Handle suffix() - DuckDB optimizes LIKE '%x' to suffix()
 			if (func.function.name == "suffix" &&
 			    func.children.size() >= 2 &&
@@ -795,6 +829,7 @@ static void InternetArchivePushdownComplexFilter(ClientContext &context, Logical
 				}
 
 				// NOT (urlkey LIKE '%pattern') -> !urlkey:.*pattern$
+				// NOT (url LIKE 'pattern') -> !original:regex  (CDX uses 'original' for URL field)
 				if ((inner_func.function.name == "like" || inner_func.function.name == "~~") &&
 				    inner_func.children.size() >= 2 &&
 				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
@@ -802,13 +837,25 @@ static void InternetArchivePushdownComplexFilter(ClientContext &context, Logical
 
 					auto &col_ref = inner_func.children[0]->Cast<BoundColumnRefExpression>();
 					auto &constant = inner_func.children[1]->Cast<BoundConstantExpression>();
+					string col_name = col_ref.GetName();
 
-					if (col_ref.GetName() == "urlkey" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+					if (col_name == "urlkey" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
 						string like_pattern = constant.value.ToString();
 						string regex_pattern = LikeToRegex(like_pattern);
 						string filter_str = "!urlkey:" + regex_pattern;
 						bind_data.cdx_filters.push_back(filter_str);
 						fprintf(stderr, "[DEBUG +%.0fms] urlkey NOT LIKE: %s -> %s\n", ElapsedMs(), like_pattern.c_str(), filter_str.c_str());
+						filters_to_remove.push_back(i);
+						continue;
+					}
+
+					// url NOT LIKE -> !original:regex (CDX field name is 'original')
+					if (col_name == "url" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+						string like_pattern = constant.value.ToString();
+						string regex_pattern = LikeToRegex(like_pattern);
+						string filter_str = "!original:" + regex_pattern;
+						bind_data.cdx_filters.push_back(filter_str);
+						fprintf(stderr, "[DEBUG +%.0fms] url NOT LIKE: %s -> %s\n", ElapsedMs(), like_pattern.c_str(), filter_str.c_str());
 						filters_to_remove.push_back(i);
 						continue;
 					}
@@ -872,7 +919,7 @@ static void InternetArchivePushdownComplexFilter(ClientContext &context, Logical
 					}
 				}
 
-				// NOT contains(urlkey, 'pattern') -> !urlkey:.*pattern.*
+				// NOT contains(urlkey/url, 'pattern') -> !urlkey:.*pattern.* or !original:.*pattern.*
 				if (inner_func.function.name == "contains" &&
 				    inner_func.children.size() >= 2 &&
 				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
@@ -880,8 +927,9 @@ static void InternetArchivePushdownComplexFilter(ClientContext &context, Logical
 
 					auto &col_ref = inner_func.children[0]->Cast<BoundColumnRefExpression>();
 					auto &constant = inner_func.children[1]->Cast<BoundConstantExpression>();
+					string col_name = col_ref.GetName();
 
-					if (col_ref.GetName() == "urlkey" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+					if ((col_name == "urlkey" || col_name == "url") && constant.value.type().id() == LogicalTypeId::VARCHAR) {
 						string contains_val = constant.value.ToString();
 						// Escape regex special chars
 						string escaped;
@@ -893,9 +941,11 @@ static void InternetArchivePushdownComplexFilter(ClientContext &context, Logical
 							}
 							escaped += c;
 						}
-						string filter_str = "!urlkey:.*" + escaped + ".*";
+						// CDX API uses 'original' for URL field
+						string cdx_field = (col_name == "url") ? "original" : col_name;
+						string filter_str = "!" + cdx_field + ":.*" + escaped + ".*";
 						bind_data.cdx_filters.push_back(filter_str);
-						fprintf(stderr, "[DEBUG +%.0fms] urlkey NOT contains: %s\n", ElapsedMs(), filter_str.c_str());
+						fprintf(stderr, "[DEBUG +%.0fms] %s NOT contains: %s\n", ElapsedMs(), col_name.c_str(), filter_str.c_str());
 						filters_to_remove.push_back(i);
 						continue;
 					}

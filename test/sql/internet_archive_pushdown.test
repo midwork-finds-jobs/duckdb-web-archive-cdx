@@ -156,6 +156,40 @@ LIMIT 1;
 true
 
 # ============================================
+# URL NOT LIKE PUSHDOWN TESTS
+# ============================================
+
+# Test url NOT LIKE pushdown - uses !original: filter
+query I
+SELECT cdx_url LIKE '%filter=!original:%' FROM internet_archive()
+WHERE url LIKE 'example.com/%'
+  AND url NOT LIKE 'example.com/%/%'
+LIMIT 1;
+----
+true
+
+# Test url NOT LIKE with simple pattern
+query I
+SELECT cdx_url LIKE '%filter=!original:.*test.*%' FROM internet_archive()
+WHERE url = 'example.com/*'
+  AND url NOT LIKE '%test%'
+LIMIT 1;
+----
+true
+
+# Test url LIKE + url NOT LIKE combined (common pattern for single-level paths)
+query I
+SELECT
+    cdx_url LIKE '%url=example.com/*%'
+    AND cdx_url LIKE '%filter=!original:%'
+FROM internet_archive()
+WHERE url LIKE 'example.com/%'
+  AND url NOT LIKE 'example.com/%/%'
+LIMIT 1;
+----
+true
+
+# ============================================
 # URLKEY FILTER PUSHDOWN TESTS
 # ============================================
 
