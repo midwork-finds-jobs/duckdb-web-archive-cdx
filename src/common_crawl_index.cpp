@@ -1029,7 +1029,7 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 				}
 			}
 			// Check if this is a SIMILAR TO function (regexp_matches / regexp_full_match)
-			// Used for regex matching on statuscode/mimetype columns
+			// Used for regex matching on url/statuscode/mimetype columns
 			else if (func.function.name == "regexp_matches" || func.function.name == "regexp_full_match") {
 				if (func.children.size() >= 2 &&
 				    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
@@ -1041,6 +1041,15 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 
 					if (constant.value.type().id() == LogicalTypeId::VARCHAR) {
 						string regex_pattern = constant.value.ToString();
+
+						// Handle url SIMILAR TO -> ~url:regex
+						if (column_name == "url") {
+							string filter_str = "~url:" + regex_pattern;
+							bind_data.cdx_filters.push_back(filter_str);
+							DUCKDB_LOG_DEBUG(context, "url SIMILAR TO: '%s' -> %s", regex_pattern.c_str(), filter_str.c_str());
+							filters_to_remove.push_back(i);
+							continue;
+						}
 						// Try to push down regex filter for statuscode/mimetype
 						if (TryAddCdxRegexFilter(context, bind_data, column_name, regex_pattern, "SIMILAR TO")) {
 							filters_to_remove.push_back(i);
@@ -1098,6 +1107,27 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 						string filter_str = "!~url:" + regex_pattern;
 						bind_data.cdx_filters.push_back(filter_str);
 						DUCKDB_LOG_DEBUG(context, "url NOT LIKE (wrapped): '%s' -> %s", like_pattern.c_str(), filter_str.c_str());
+						filters_to_remove.push_back(i);
+						continue;
+					}
+				}
+
+				// NOT regexp_matches(url, 'pattern') or NOT regexp_full_match(url, 'pattern') -> !~url:regex
+				// This handles NOT SIMILAR TO for the url column
+				if ((inner_func.function.name == "regexp_matches" || inner_func.function.name == "regexp_full_match") &&
+				    inner_func.children.size() >= 2 &&
+				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    inner_func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+
+					auto &col_ref = inner_func.children[0]->Cast<BoundColumnRefExpression>();
+					auto &constant = inner_func.children[1]->Cast<BoundConstantExpression>();
+					string column_name = col_ref.GetName();
+
+					if (column_name == "url" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+						string regex_pattern = constant.value.ToString();
+						string filter_str = "!~url:" + regex_pattern;
+						bind_data.cdx_filters.push_back(filter_str);
+						DUCKDB_LOG_DEBUG(context, "url NOT SIMILAR TO: '%s' -> %s", regex_pattern.c_str(), filter_str.c_str());
 						filters_to_remove.push_back(i);
 						continue;
 					}
