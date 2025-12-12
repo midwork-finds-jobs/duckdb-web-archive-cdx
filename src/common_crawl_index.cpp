@@ -995,6 +995,39 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 					}
 				}
 			}
+			// Check if this is a NOT LIKE function (!~~ or not_like)
+			// url NOT LIKE 'pattern' -> &filter=!url:regex
+			else if (func.function.name == "!~~" || func.function.name == "not_like") {
+				if (func.children.size() >= 2 &&
+				    func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+
+					auto &col_ref = func.children[0]->Cast<BoundColumnRefExpression>();
+					auto &constant = func.children[1]->Cast<BoundConstantExpression>();
+					string column_name = col_ref.GetName();
+
+					if (constant.value.type().id() == LogicalTypeId::VARCHAR) {
+						string like_pattern = constant.value.ToString();
+						string regex_pattern = SqlRegexToRegex(like_pattern);
+
+						if (column_name == "url") {
+							// url NOT LIKE -> !url:regex
+							string filter_str = "!url:" + regex_pattern;
+							bind_data.cdx_filters.push_back(filter_str);
+							DUCKDB_LOG_DEBUG(context, "url NOT LIKE: '%s' -> %s", like_pattern.c_str(), filter_str.c_str());
+							filters_to_remove.push_back(i);
+							continue;
+						}
+						// Handle mimetype/statuscode NOT LIKE
+						else if (CC_CDX_REGEX_COLUMNS.find(column_name) != CC_CDX_REGEX_COLUMNS.end()) {
+							if (TryAddCdxRegexFilter(context, bind_data, column_name, regex_pattern, "NOT LIKE", true)) {
+								filters_to_remove.push_back(i);
+								continue;
+							}
+						}
+					}
+				}
+			}
 			// Check if this is a SIMILAR TO function (regexp_matches / regexp_full_match)
 			// Used for regex matching on statuscode/mimetype columns
 			else if (func.function.name == "regexp_matches" || func.function.name == "regexp_full_match") {
@@ -1013,6 +1046,60 @@ static void CommonCrawlPushdownComplexFilter(ClientContext &context, LogicalGet 
 							filters_to_remove.push_back(i);
 							continue;
 						}
+					}
+				}
+			}
+		}
+
+		// Handle OPERATOR_NOT wrapping functions like prefix(), suffix(), contains(), like()
+		// DuckDB sometimes wraps NOT LIKE as NOT(prefix()) or NOT(like())
+		if (filter->GetExpressionClass() == ExpressionClass::BOUND_OPERATOR &&
+		    filter->type == ExpressionType::OPERATOR_NOT) {
+			auto &op = filter->Cast<BoundOperatorExpression>();
+			if (op.children.size() >= 1 &&
+			    op.children[0]->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+
+				auto &inner_func = op.children[0]->Cast<BoundFunctionExpression>();
+
+				// NOT prefix(url, 'pattern') -> !url:^pattern.*$
+				if (inner_func.function.name == "prefix" &&
+				    inner_func.children.size() >= 2 &&
+				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    inner_func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+
+					auto &col_ref = inner_func.children[0]->Cast<BoundColumnRefExpression>();
+					auto &constant = inner_func.children[1]->Cast<BoundConstantExpression>();
+					string column_name = col_ref.GetName();
+
+					if (column_name == "url" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+						string prefix_str = constant.value.ToString();
+						string regex_pattern = "^" + EscapeRegexSpecialChars(prefix_str) + ".*$";
+						string filter_str = "!url:" + regex_pattern;
+						bind_data.cdx_filters.push_back(filter_str);
+						DUCKDB_LOG_DEBUG(context, "url NOT PREFIX: '%s' -> %s", prefix_str.c_str(), filter_str.c_str());
+						filters_to_remove.push_back(i);
+						continue;
+					}
+				}
+
+				// NOT like(url, 'pattern') or NOT ~~(url, 'pattern') -> !url:regex
+				if ((inner_func.function.name == "like" || inner_func.function.name == "~~") &&
+				    inner_func.children.size() >= 2 &&
+				    inner_func.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    inner_func.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+
+					auto &col_ref = inner_func.children[0]->Cast<BoundColumnRefExpression>();
+					auto &constant = inner_func.children[1]->Cast<BoundConstantExpression>();
+					string column_name = col_ref.GetName();
+
+					if (column_name == "url" && constant.value.type().id() == LogicalTypeId::VARCHAR) {
+						string like_pattern = constant.value.ToString();
+						string regex_pattern = SqlRegexToRegex(like_pattern);
+						string filter_str = "!url:" + regex_pattern;
+						bind_data.cdx_filters.push_back(filter_str);
+						DUCKDB_LOG_DEBUG(context, "url NOT LIKE (wrapped): '%s' -> %s", like_pattern.c_str(), filter_str.c_str());
+						filters_to_remove.push_back(i);
+						continue;
 					}
 				}
 			}
