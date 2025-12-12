@@ -172,3 +172,17 @@ true
 # Test DISTINCT ON(digest) syntax is valid (requires network so use LIMIT 0 pattern)
 statement ok
 SELECT DISTINCT ON(digest) url, digest FROM wayback_machine() WHERE url = 'archive.org' LIMIT 0;
+
+# Test DISTINCT ON(year) adds &collapse=timestamp:4 to CDX URL (no network - collapse covers timestamp)
+query I
+SELECT DISTINCT ON(year) cdx_url LIKE '%&collapse=timestamp:4%' AS has_year_collapse
+FROM wayback_machine(debug := true) WHERE url = 'archive.org';
+----
+true
+
+# Test DISTINCT ON(year, month) adds &collapse=timestamp:6 to CDX URL
+query I
+SELECT DISTINCT ON(year, month) cdx_url LIKE '%&collapse=timestamp:6%' AS has_year_month_collapse
+FROM wayback_machine(debug := true) WHERE url = 'archive.org';
+----
+true

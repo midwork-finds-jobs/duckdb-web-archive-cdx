@@ -503,9 +503,38 @@ static unique_ptr<GlobalTableFunctionState> WaybackMachineInitGlobal(ClientConte
 	// Check if only cdx_url is selected (debug mode, fields_needed is empty and no response)
 	bind_data.cdx_url_only = bind_data.debug && bind_data.fields_needed.empty() && !bind_data.fetch_response;
 
+	// Enhanced check: if collapse is set and all needed fields are covered by collapse base, skip fetch
+	// This enables testing DISTINCT ON collapse optimization without network requests
+	if (!bind_data.cdx_url_only && bind_data.debug && !bind_data.collapse.empty() && !bind_data.fetch_response) {
+		// Parse collapse base field (e.g., "timestamp:4" -> "timestamp")
+		std::string collapse_base = bind_data.collapse;
+		auto colon_pos = collapse_base.find(':');
+		if (colon_pos != std::string::npos) {
+			collapse_base = collapse_base.substr(0, colon_pos);
+		}
+
+		// Check if all fields_needed are derived from collapse base
+		bool all_covered = true;
+		for (const auto &field : bind_data.fields_needed) {
+			// timestamp collapse covers timestamp field (used for year/month)
+			if (collapse_base == "timestamp" && field == "timestamp") {
+				continue;
+			}
+			// Other fields not covered
+			all_covered = false;
+			break;
+		}
+
+		if (all_covered) {
+			DUCKDB_LOG_DEBUG(context, "All fields covered by collapse=%s - skipping network request",
+			                 bind_data.collapse.c_str());
+			bind_data.cdx_url_only = true;
+		}
+	}
+
 	if (bind_data.cdx_url_only) {
 		// Only cdx_url is selected - build URL without network request
-		DUCKDB_LOG_DEBUG(context, "Only cdx_url selected (debug mode) - skipping network request");
+		DUCKDB_LOG_DEBUG(context, "cdx_url_only mode - skipping network request");
 		bind_data.cdx_url =
 		    BuildArchiveOrgCDXUrl(bind_data.url_filter, bind_data.match_type, bind_data.fields_needed,
 		                          bind_data.cdx_filters, bind_data.from_date, bind_data.to_date, bind_data.max_results,
@@ -514,6 +543,7 @@ static unique_ptr<GlobalTableFunctionState> WaybackMachineInitGlobal(ClientConte
 
 		// Create a single dummy record so we return one row with the cdx_url
 		ArchiveOrgRecord dummy;
+		dummy.timestamp = "202501010000"; // Dummy timestamp for year/month extraction
 		state->records.push_back(dummy);
 	} else {
 		// Query Internet Archive CDX API
@@ -1397,30 +1427,12 @@ static const std::unordered_map<string, string> COLLAPSE_COLUMNS = {
     {"digest", "digest"}, {"timestamp", "timestamp"}, {"length", "length"},    {"statuscode", "statuscode"},
     {"urlkey", "urlkey"}, {"url", "original"},        {"mimetype", "mimetype"}};
 
-// Helper to check if a DISTINCT ON targets a collapsible column
-// Returns the CDX API field name if found, empty string otherwise
-static string GetDistinctOnCollapseField(const LogicalDistinct &distinct, const LogicalGet &get) {
-	if (distinct.distinct_type != DistinctType::DISTINCT_ON) {
-		return "";
-	}
-
+// Helper to find all distinct target column names
+static std::set<string> GetDistinctOnColumnNames(const LogicalDistinct &distinct, const LogicalGet &get) {
+	std::set<string> result;
 	auto &bind_data = get.bind_data->Cast<WaybackMachineBindData>();
 	auto &column_ids = get.GetColumnIds();
 
-	// Find all collapsible columns in the projection
-	std::unordered_map<idx_t, string> orig_col_to_cdx;
-	for (idx_t i = 0; i < column_ids.size(); i++) {
-		idx_t orig_idx = column_ids[i].GetPrimaryIndex();
-		if (orig_idx < bind_data.column_names.size()) {
-			const string &col_name = bind_data.column_names[orig_idx];
-			auto it = COLLAPSE_COLUMNS.find(col_name);
-			if (it != COLLAPSE_COLUMNS.end()) {
-				orig_col_to_cdx[orig_idx] = it->second;
-			}
-		}
-	}
-
-	// Check each distinct target
 	for (const auto &target : distinct.distinct_targets) {
 		if (target->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			auto &col_ref = target->Cast<BoundColumnRefExpression>();
@@ -1429,27 +1441,72 @@ static string GetDistinctOnCollapseField(const LogicalDistinct &distinct, const 
 			// Try mapping binding directly to column_ids position
 			if (binding_col < column_ids.size()) {
 				idx_t orig_col_idx = column_ids[binding_col].GetPrimaryIndex();
-				auto it = orig_col_to_cdx.find(orig_col_idx);
-				if (it != orig_col_to_cdx.end()) {
-					return it->second;
-				}
-			}
-
-			// Also try: binding might be referencing a different ordering
-			// Search for a collapsible column that matches the binding
-			for (idx_t i = 0; i < column_ids.size(); i++) {
-				idx_t orig_idx = column_ids[i].GetPrimaryIndex();
-				// If this original column is collapsible and matches our expected pattern
-				auto it = orig_col_to_cdx.find(orig_idx);
-				if (it != orig_col_to_cdx.end()) {
-					// Check if only one collapsible column exists - if so, use it
-					if (orig_col_to_cdx.size() == 1) {
-						return it->second;
-					}
+				if (orig_col_idx < bind_data.column_names.size()) {
+					result.insert(bind_data.column_names[orig_col_idx]);
 				}
 			}
 		}
 	}
+
+	// Fallback: if no columns found via binding, look for single collapsible column
+	if (result.empty()) {
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			idx_t orig_idx = column_ids[i].GetPrimaryIndex();
+			if (orig_idx < bind_data.column_names.size()) {
+				const string &col_name = bind_data.column_names[orig_idx];
+				// Check if it's a collapsible column or year/month
+				if (COLLAPSE_COLUMNS.count(col_name) || col_name == "year" || col_name == "month") {
+					result.insert(col_name);
+				}
+			}
+		}
+		// Only use fallback if exactly one collapsible column found
+		if (result.size() != 1) {
+			result.clear();
+		}
+	}
+
+	return result;
+}
+
+// Helper to check if a DISTINCT ON targets a collapsible column
+// Returns the CDX API collapse parameter value if found, empty string otherwise
+static string GetDistinctOnCollapseField(const LogicalDistinct &distinct, const LogicalGet &get) {
+	if (distinct.distinct_type != DistinctType::DISTINCT_ON) {
+		return "";
+	}
+
+	auto distinct_cols = GetDistinctOnColumnNames(distinct, get);
+	if (distinct_cols.empty()) {
+		return "";
+	}
+
+	// Special handling for year and month columns
+	// timestamp format is YYYYMMDDhhmmss
+	// year = first 4 chars, year+month = first 6 chars
+	bool has_year = distinct_cols.count("year") > 0;
+	bool has_month = distinct_cols.count("month") > 0;
+
+	if (has_year && has_month) {
+		// DISTINCT ON(year, month) -> collapse on first 6 chars of timestamp
+		return "timestamp:6";
+	} else if (has_year) {
+		// DISTINCT ON(year) -> collapse on first 4 chars of timestamp
+		return "timestamp:4";
+	} else if (has_month) {
+		// DISTINCT ON(month) alone -> collapse on first 6 chars (year+month)
+		// (month alone doesn't make sense without year context)
+		return "timestamp:6";
+	}
+
+	// Check for regular collapsible columns
+	for (const auto &col_name : distinct_cols) {
+		auto it = COLLAPSE_COLUMNS.find(col_name);
+		if (it != COLLAPSE_COLUMNS.end()) {
+			return it->second;
+		}
+	}
+
 	return "";
 }
 
