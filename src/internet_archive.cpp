@@ -354,6 +354,12 @@ static unique_ptr<GlobalTableFunctionState> InternetArchiveInitGlobal(ClientCont
                                                                         TableFunctionInitInput &input) {
 	fprintf(stderr, "[DEBUG +%.0fms] InternetArchiveInitGlobal called\n", ElapsedMs());
 	auto &bind_data = const_cast<InternetArchiveBindData&>(input.bind_data->Cast<InternetArchiveBindData>());
+
+	// Validate URL filter - don't allow queries without a specific URL
+	if (bind_data.url_filter == "*" || bind_data.url_filter.empty()) {
+		throw InvalidInputException("internet_archive() requires a URL filter. Use WHERE url = 'example.com', WHERE url LIKE 'example.com/%', or WHERE url LIKE '%.example.com' for subdomains");
+	}
+
 	auto state = make_uniq<InternetArchiveGlobalState>();
 
 	// Store projected columns

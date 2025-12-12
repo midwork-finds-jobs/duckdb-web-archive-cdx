@@ -16,6 +16,12 @@ SELECT * FROM internet_archive(unknown_param := 10);
 ----
 Invalid named parameter
 
+# Test error: internet_archive requires URL filter
+statement error
+SELECT * FROM internet_archive() LIMIT 1;
+----
+requires a URL filter
+
 # Test error: wrong type for max_results (string instead of integer)
 statement error
 SELECT * FROM common_crawl_index(max_results := 'not_a_number');
