@@ -3,7 +3,7 @@
 # group: [sql]
 
 # These tests require httpfs for network access to verify actual responses
-require web_archive_cdx
+require web_archive
 
 require httpfs
 

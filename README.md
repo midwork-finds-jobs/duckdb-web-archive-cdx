@@ -12,8 +12,8 @@ DuckDB extension to query web archive CDX APIs directly from SQL.
 ## Installation
 
 ```sql
-INSTALL web_archive_cdx FROM community;
-LOAD web_archive_cdx;
+INSTALL web_archive FROM community;
+LOAD web_archive;
 ```
 
 ## Quick Start: Track GitHub Stars Over Time

@@ -2,7 +2,7 @@
 # description: Integration tests combining multiple features
 # group: [sql]
 
-require web_archive_cdx
+require web_archive
 
 # Test projection + filter + limit
 statement ok

@@ -1,4 +1,4 @@
-#include "web_archive_cdx_utils.hpp"
+#include "web_archive_utils.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/logging/logger.hpp"

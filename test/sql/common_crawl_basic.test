@@ -2,7 +2,7 @@
 # description: Basic tests for common_crawl_index function
 # group: [sql]
 
-require web_archive_cdx
+require web_archive
 
 # Test that httpfs is loaded (required for the extension)
 query I

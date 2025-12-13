@@ -1,4 +1,4 @@
-#include "web_archive_cdx_utils.hpp"
+#include "web_archive_utils.hpp"
 #include <thread>
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"

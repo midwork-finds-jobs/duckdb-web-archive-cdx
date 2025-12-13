@@ -2,7 +2,7 @@
 # description: Basic tests for internet_archive function
 # group: [sql]
 
-require web_archive_cdx
+require web_archive
 
 # Test that internet_archive function exists
 statement ok

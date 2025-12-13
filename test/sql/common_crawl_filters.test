@@ -2,7 +2,7 @@
 # description: Test filter pushdown for common_crawl_index
 # group: [sql]
 
-require web_archive_cdx
+require web_archive
 
 # Test WHERE clause with crawl_id
 statement ok

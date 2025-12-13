@@ -2,7 +2,7 @@
 # description: Test named parameters for common_crawl_index and internet_archive
 # group: [sql]
 
-require web_archive_cdx
+require web_archive
 
 # Test common_crawl_index with max_results named parameter
 statement ok

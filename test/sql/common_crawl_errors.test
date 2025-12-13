@@ -2,7 +2,7 @@
 # description: Test error handling and edge cases
 # group: [sql]
 
-require web_archive_cdx
+require web_archive
 
 # Test error: unknown named parameter for common_crawl_index
 statement error

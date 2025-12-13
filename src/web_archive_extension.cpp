@@ -1,7 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "web_archive_cdx_extension.hpp"
-#include "web_archive_cdx_utils.hpp"
+#include "web_archive_extension.hpp"
+#include "web_archive_utils.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
 
@@ -40,15 +40,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.optimizer_extensions.push_back(std::move(optimizer));
 }
 
-void WebArchiveCdxExtension::Load(ExtensionLoader &loader) {
+void WebArchiveExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 
-std::string WebArchiveCdxExtension::Name() {
-	return "web_archive_cdx";
+std::string WebArchiveExtension::Name() {
+	return "web_archive";
 }
 
-std::string WebArchiveCdxExtension::Version() const {
+std::string WebArchiveExtension::Version() const {
 #ifdef EXT_VERSION_WEB_ARCHIVE_CDX
 	return EXT_VERSION_WEB_ARCHIVE_CDX;
 #else
@@ -60,7 +60,7 @@ std::string WebArchiveCdxExtension::Version() const {
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(web_archive_cdx, loader) {
+DUCKDB_CPP_EXTENSION_ENTRY(web_archive, loader) {
 	duckdb::LoadInternal(loader);
 }
 }

@@ -2,7 +2,7 @@
 # description: Test STRUCT and MAP types in common_crawl_index
 # group: [sql]
 
-require web_archive_cdx
+require web_archive
 
 # Test response STRUCT has correct structure
 query I

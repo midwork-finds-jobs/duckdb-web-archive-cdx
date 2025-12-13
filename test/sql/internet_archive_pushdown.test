@@ -5,7 +5,7 @@
 # NOTE: When only cdx_url is selected with debug := true, no network request is made.
 # This allows testing URL construction without httpfs or network access.
 
-require web_archive_cdx
+require web_archive
 
 # Test cdx_url column exists only with debug := true
 query I
