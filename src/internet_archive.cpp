@@ -98,7 +98,10 @@ static string BuildArchiveOrgCDXUrl(const string &url_pattern, const string &mat
 	}
 
 	// Construct the CDX API URL (use CSV format - space delimited, fields in fl order)
-	string cdx_url = "https://web.archive.org/cdx/search/cdx?url=" + url_pattern + "&output=csv&fl=" + field_list;
+	string cdx_url = "https://web.archive.org/cdx/search/cdx?url=" + url_pattern + "&output=csv";
+	if (!field_list.empty()) {
+		cdx_url += "&fl=" + field_list;
+	}
 
 	// Add matchType if not exact (default)
 	if (match_type != "exact") {
