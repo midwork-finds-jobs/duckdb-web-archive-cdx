@@ -39,14 +39,10 @@ string LikeToRegex(const string &like_pattern) {
 		char c = like_pattern[i];
 
 		// Handle escape sequences in LIKE pattern (backslash escapes next char)
+		// Pass through as-is: \) becomes \) in the regex
 		if (c == '\\' && i + 1 < like_pattern.size()) {
 			char next = like_pattern[i + 1];
-			// Escaped char is literal - escape it for regex if needed
-			if (next == '.' || next == '(' || next == ')' || next == '[' || next == ']' || next == '{' || next == '}' ||
-			    next == '+' || next == '?' || next == '^' || next == '$' || next == '|' || next == '\\' ||
-			    next == '*') {
-				regex += '\\';
-			}
+			regex += '\\';
 			regex += next;
 			i++; // Skip the escaped character
 			continue;
@@ -58,7 +54,7 @@ string LikeToRegex(const string &like_pattern) {
 			regex += ".";
 		} else if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' ||
 		           c == '?' || c == '^' || c == '$' || c == '|') {
-			// Escape regex special chars
+			// Escape regex special chars with backslash (like SqlRegexToJavaRegex)
 			regex += '\\';
 			regex += c;
 		} else {

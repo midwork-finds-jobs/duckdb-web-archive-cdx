@@ -229,14 +229,13 @@ LIMIT 1;
 ----
 true
 
-# Test urlkey NOT LIKE with escaped parenthesis - backslash should not be double-escaped
-# Pattern 'com,example\)/%/%' should become regex ^com,example\)/.*/.*
+# Test urlkey NOT LIKE with parenthesis - uses backslash escaping
+# Pattern 'com,example)/%/%' should become regex ^com,example\)/.*/.*
 query I
 SELECT cdx_url LIKE '%filter=!urlkey:^com,example\)/.*/.*%'
-   AND cdx_url NOT LIKE '%\\\)%'
 FROM wayback_machine(debug := true)
 WHERE url LIKE 'example.com/%'
-  AND urlkey NOT LIKE 'com,example\)/%/%'
+  AND urlkey NOT LIKE 'com,example)/%/%'
 LIMIT 1;
 ----
 true

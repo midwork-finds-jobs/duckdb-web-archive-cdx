@@ -766,14 +766,17 @@ static void CommonCrawlScan(ClientContext &context, TableFunctionInput &data, Da
 static const std::set<string> CC_CDX_REGEX_COLUMNS = {"mimetype", "statuscode"};
 
 // Escape regex special characters in a literal string
+// Uses backslash escaping (raw backslashes work with httpfs)
 static string EscapeRegexSpecialChars(const string &literal) {
 	string result;
 	for (char c : literal) {
 		if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' ||
 		    c == '*' || c == '^' || c == '$' || c == '\\' || c == '|') {
 			result += '\\';
+			result += c;
+		} else {
+			result += c;
 		}
-		result += c;
 	}
 	return result;
 }

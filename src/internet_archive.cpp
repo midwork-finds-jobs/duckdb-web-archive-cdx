@@ -717,14 +717,17 @@ static string SqlRegexToJavaRegex(const string &sql_regex) {
 }
 
 // Escape regex special characters for contains() patterns
+// Uses backslash escaping (raw backslashes work with httpfs)
 static string EscapeRegex(const string &val) {
 	string escaped;
 	for (char c : val) {
 		if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' ||
 		    c == '^' || c == '$' || c == '|' || c == '\\' || c == '*') {
 			escaped += '\\';
+			escaped += c;
+		} else {
+			escaped += c;
 		}
-		escaped += c;
 	}
 	return escaped;
 }
