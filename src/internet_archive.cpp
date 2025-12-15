@@ -700,14 +700,18 @@ static void WaybackMachineScan(ClientContext &context, TableFunctionInput &data,
 static const std::set<string> CDX_REGEX_COLUMNS = {"urlkey", "mimetype", "statuscode"};
 
 // Convert SQL SIMILAR TO pattern to Java regex (anchored)
-// Handles: % -> .*, _ -> ., * -> .*
+// Handles: % -> .*, _ -> ., * -> .*, skips backslash (pass through escaped char)
 static string SqlRegexToJavaRegex(const string &sql_regex) {
 	string regex = "^";
-	for (char c : sql_regex) {
+	for (size_t i = 0; i < sql_regex.size(); i++) {
+		char c = sql_regex[i];
 		if (c == '%' || c == '*') {
 			regex += ".*";
 		} else if (c == '_') {
 			regex += ".";
+		} else if (c == '\\' && i + 1 < sql_regex.size()) {
+			// Skip backslash, output next char as literal
+			regex += sql_regex[++i];
 		} else {
 			regex += c;
 		}
@@ -717,14 +721,17 @@ static string SqlRegexToJavaRegex(const string &sql_regex) {
 }
 
 // Escape regex special characters for contains() patterns
-// Uses backslash escaping (raw backslashes work with httpfs)
+// Note: () not escaped - Java regex allows unmatched ) as literal, and urlkey uses ) as separator
 static string EscapeRegex(const string &val) {
 	string escaped;
 	for (char c : val) {
-		if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' ||
-		    c == '^' || c == '$' || c == '|' || c == '\\' || c == '*') {
-			escaped += '\\';
+		if (c == '.' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' || c == '^' || c == '$' ||
+		    c == '|' || c == '*') {
+			escaped += "%5C";
 			escaped += c;
+		} else if (c == '\\') {
+			// Skip backslash escape sequences - just output the next char
+			continue;
 		} else {
 			escaped += c;
 		}

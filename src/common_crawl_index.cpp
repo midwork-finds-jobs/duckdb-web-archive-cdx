@@ -766,14 +766,17 @@ static void CommonCrawlScan(ClientContext &context, TableFunctionInput &data, Da
 static const std::set<string> CC_CDX_REGEX_COLUMNS = {"mimetype", "statuscode"};
 
 // Escape regex special characters in a literal string
-// Uses backslash escaping (raw backslashes work with httpfs)
+// Note: () not escaped - Java regex allows unmatched ) as literal
 static string EscapeRegexSpecialChars(const string &literal) {
 	string result;
 	for (char c : literal) {
-		if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' ||
-		    c == '*' || c == '^' || c == '$' || c == '\\' || c == '|') {
-			result += '\\';
+		if (c == '.' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' || c == '*' || c == '^' ||
+		    c == '$' || c == '|') {
+			result += "%5C";
 			result += c;
+		} else if (c == '\\') {
+			// Skip backslash
+			continue;
 		} else {
 			result += c;
 		}
@@ -782,7 +785,7 @@ static string EscapeRegexSpecialChars(const string &literal) {
 }
 
 // Convert SQL SIMILAR TO pattern to regex (anchored with ^ and $)
-// Handles: % -> .*, _ -> ., * -> .*
+// Handles: % -> .*, _ -> ., * -> .*, skips backslash (pass through escaped char)
 static string SqlRegexToRegex(const string &sql_regex) {
 	string regex = "^";
 	for (size_t i = 0; i < sql_regex.size(); i++) {
@@ -794,10 +797,13 @@ static string SqlRegexToRegex(const string &sql_regex) {
 		} else if (c == '*') {
 			// SQL SIMILAR TO uses * for regex-like patterns
 			regex += ".*";
-		} else if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' ||
-		           c == '?' || c == '$' || c == '\\') {
-			// Escape regex special chars (but not ^ since we add it ourselves)
-			regex += '\\';
+		} else if (c == '\\' && i + 1 < sql_regex.size()) {
+			// Skip backslash, output next char as literal
+			regex += sql_regex[++i];
+		} else if (c == '.' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' || c == '$') {
+			// Escape regex special chars with %5C (but not ^ since we add it ourselves)
+			// Note: () not escaped - Java regex allows unmatched ) as literal
+			regex += "%5C";
 			regex += c;
 		} else {
 			regex += c;

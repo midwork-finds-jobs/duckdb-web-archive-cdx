@@ -1,10 +1,23 @@
 # duckdb-web-archive-cdx - DuckDB extension to query archived web pages
 
 This extension provides two table functions:
+
 1. **common_crawl_index()** - Query Common Crawl web archive (2008-present, monthly snapshots)
 2. **wayback_machine()** - Query Internet Archive Wayback Machine (1996-present, continuous)
 
-## Example of how duckdb can be used with this extension:
+## Do not remove the whole release between builds
+
+```sh
+# This is much slower
+$ rm -rf build/release && make release GEN=ninja
+
+# Than this:
+$ make release GEN=ninja
+```
+
+Only delete the `build` folder if you encounter weird hard to debug issues.
+
+## Example of how duckdb can be used with this extension
 
 ```sql
 SELECT response, url
@@ -17,6 +30,7 @@ LIMIT 10;                            -- LIMIT is automatically pushed down to CD
 ```
 
 LIMIT and result size:
+
 ```sql
 -- The extension fetches up to 10000 results from CDX API by default
 -- Use WHERE clauses to narrow down the result set
@@ -27,16 +41,17 @@ SELECT url FROM common_crawl_index() WHERE crawl_id = 'CC-MAIN-2025-43' LIMIT 10
 The extension automatically uses the `&fl=` query parameter to fetch only the fields which are needed from the index server.
 
 If response is requested you need these 3 parameters from the index server:
-```
+
+```text
 &fl=filename,offset,length
 ```
 
 If only `url` is requested then you don't need to query the warc files with range requests. `&url=` query parameter for the index server supports wildcards:
 `https://example.com/*` will search for all paths
 
-See index server API docs: https://github.com/webrecorder/pywb/wiki/CDX-Server-API#api-reference
+See index server API docs: <https://github.com/webrecorder/pywb/wiki/CDX-Server-API#api-reference>
 
-All common crawl indexes and their metadata can be found from: https://index.commoncrawl.org/collinfo.json
+All common crawl indexes and their metadata can be found from: <https://index.commoncrawl.org/collinfo.json>
 
 ## Internet Archive Wayback Machine
 
@@ -65,6 +80,7 @@ WHERE url LIKE '*.archive.org'      -- Domain match (includes subdomains)
 ```
 
 **Key differences from common_crawl_index():**
+
 - Much simpler data retrieval (no WARC parsing)
 - Historical data from 1996 onwards
 - Response column is raw HTTP body (not structured WARC)
@@ -81,13 +97,13 @@ Do not create a new http client. You want to autoload `httpfs` in the extension 
 void MyExtension::Load(DuckDB &db) {
     Connection con(db);
     con.BeginTransaction();
-    
+
     // Auto-load httpfs
     auto result = con.Query("INSTALL httpfs; LOAD httpfs;");
     if (result->HasError()) {
         throw std::runtime_error("Failed to load httpfs: " + result->GetError());
     }
-    
+
     con.Commit();
     // ... rest of load logic
 }
@@ -96,20 +112,22 @@ void MyExtension::Load(DuckDB &db) {
 ## Example url with filters
 
 Here's an example which only loads pages with statuscode:200 and where mime is not a pdf:
-```
+
+```sh
 curl -v 'https://index.commoncrawl.org/CC-MAIN-2025-43-index?url=*.example.com/*&output=json&fl=url,timestamp,filename,offset,length&limit=2&filter==statuscode:200&filter=!mime:application/pdf'
 ```
 
 This query works as is! There's no need to urlencode the '!' character for example.
 
 ## Example working script with curl
+
 The included `./common-crawl.sh` shows an example of how to query common crawl index server and then using the returned values to get the body of the http response.
 
 example output from: `./common-crawl.sh 'https://careers.swappie.com/jobs/6559247-maintenance-and-engineering-lead-operations'`
 
 is here below:
 
-```
+```text
 WARC/1.0
 WARC-Type: response
 WARC-Date: 2025-10-09T05:36:22Z

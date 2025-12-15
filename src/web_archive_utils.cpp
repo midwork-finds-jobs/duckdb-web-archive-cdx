@@ -39,12 +39,11 @@ string LikeToRegex(const string &like_pattern) {
 		char c = like_pattern[i];
 
 		// Handle escape sequences in LIKE pattern (backslash escapes next char)
-		// Pass through as-is: \) becomes \) in the regex
+		// Just pass through the escaped character - most regex engines handle literals fine
 		if (c == '\\' && i + 1 < like_pattern.size()) {
 			char next = like_pattern[i + 1];
-			regex += '\\';
-			regex += next;
-			i++; // Skip the escaped character
+			regex += next; // Skip the backslash, just output the char
+			i++;
 			continue;
 		}
 
@@ -52,12 +51,14 @@ string LikeToRegex(const string &like_pattern) {
 			regex += ".*";
 		} else if (c == '_') {
 			regex += ".";
-		} else if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' ||
-		           c == '?' || c == '^' || c == '$' || c == '|') {
-			// Escape regex special chars with backslash (like SqlRegexToJavaRegex)
-			regex += '\\';
+		} else if (c == '.' || c == '[' || c == ']' || c == '{' || c == '}' || c == '+' || c == '?' || c == '^' ||
+		           c == '$' || c == '|' || c == '*') {
+			// Escape regex special chars that MUST be escaped
+			// Note: () are NOT escaped - Java regex allows unmatched ) as literal
+			regex += "%5C";
 			regex += c;
 		} else {
+			// Pass through (, ), and other chars as-is
 			regex += c;
 		}
 	}

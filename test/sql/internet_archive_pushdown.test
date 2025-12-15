@@ -229,10 +229,11 @@ LIMIT 1;
 ----
 true
 
-# Test urlkey NOT LIKE with parenthesis - uses backslash escaping
-# Pattern 'com,example)/%/%' should become regex ^com,example\)/.*/.*
+# Test urlkey NOT LIKE with parenthesis - parenthesis passed through unescaped
+# Pattern 'com,example)/%/%' should become regex ^com,example)/.*/.*
+# Java regex allows unmatched ) as literal character
 query I
-SELECT cdx_url LIKE '%filter=!urlkey:^com,example\)/.*/.*%'
+SELECT cdx_url LIKE '%filter=!urlkey:^com,example)/.*/.*%'
 FROM wayback_machine(debug := true)
 WHERE url LIKE 'example.com/%'
   AND urlkey NOT LIKE 'com,example)/%/%'
